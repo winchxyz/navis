@@ -1,0 +1,192 @@
+# NAVIS
+
+A flooded Gothic cathedral. One scene, one view, real time.
+Three.js, rasterised. Nothing accumulates, nothing makes you wait — the first frame
+looks like the hundredth.
+
+**[Open the demo →](https://winchxyz.github.io/navis/)**
+
+![The nave](screenshots/nave.png)
+
+Everything in it is procedural. There are no models, no textures, no HDRIs, no audio
+files. One HTML file, one CDN import of three.js, and about two thousand lines that
+draw the rose window to a canvas, generate marble, synthesise the reverb of a stone
+nave, and build the vault out of Coons patches.
+
+---
+
+## Controls
+
+| | |
+|---|---|
+| **WASD** / arrows | move — pressing any of them leaves the scripted camera |
+| **Q** / **E** | down / up |
+| **Shift** | faster · **wheel** — set speed |
+| **drag** / **double-click** | look · double-click grabs the pointer |
+| **F** | free flight ↔ cinematic path |
+| **Space** | pause the path |
+| **P** | photo mode — UI hidden, 2× render scale |
+| **Enter** | save a PNG |
+| **H** | hide the panel |
+
+Click once anywhere to start the audio; browsers will not begin it without a gesture.
+
+Every number that shapes the image is in the panel — six art-directed *looks*, four
+quality tiers, and about seventy individual controls. Settings persist in
+`localStorage`.
+
+---
+
+## The five things carrying the image
+
+### 1. The rose window is a projected texture
+
+The single most useful decision in the whole scene. The rose is not transmissive
+geometry — it is drawn once to a 2048² canvas with twelvefold symmetry and hung on
+`SpotLight.map`.
+
+```js
+const spot = new THREE.SpotLight(0xffffff, 26000, 0, 0.42, 0.15, 2);
+spot.map = roseTexture;
+spot.castShadow = true;
+```
+
+That one object gives you three subsystems for free: coloured patches on the columns,
+a coloured source to tint the caustics, and a coloured source for the volumetric
+shafts. The side lancets work the same way, twenty times weaker.
+
+### 2. Water: a planar reflector plus screen-space refraction
+
+Not SSR, not a cubemap. A second camera mirrored across the water plane renders into
+a half-resolution target with a clipping plane at the surface.
+
+Refraction is screen space. The scene is drawn once **without** the water into a
+buffer that packs colour in `rgb` and linear depth in `a`; then the water is drawn
+last, on its own layer, sampling that copy. Packing both into one target means one
+blit — and, more importantly, no feedback loop, since the water writes into the scene
+target while reading a copy rather than the depth attachment it is bound to.
+
+Because the refraction is screen space, *everything* submerged shows through: the
+marble floor, the column bases, the caustics already baked onto them. The distance
+light travelled through water falls out of the depth difference.
+
+### 3. Gerstner waves, in the vertex shader
+
+Four waves with descending amplitudes and analytic normals. Real vertex
+displacement, not a normal map, so the waterline against the columns actually moves.
+Total steepness is capped at 0.10 — there is no wind inside a cathedral.
+
+The wave constants live in one JS array and the GLSL is generated from it, so
+anything floating on the surface solves the same equation the vertex shader does.
+There is no drift between them.
+
+One detail that took a while to see: with the eye exactly on the waterline, a crest
+two centimetres high swamps the frame and smears the grazing reflection across it.
+The surface is flattened in a small disc around the camera, and only while it is in
+that band.
+
+### 4. Caustics: an animated texture, tinted by the projection
+
+Three layers of tileable Voronoi multiplied together — the `F2 − F1` ridge term is
+what gives the thin filaments; the `F1` blob alone reads as bubbles. Two scrolling
+samples at different scales and speeds, so the pattern never visibly loops.
+
+The colour is read back out of the rose projection, so a ruby shaft lays down ruby
+caustics. Clamped to below the surface and to upward-facing normals, or it crawls up
+the columns.
+
+### 5. Volumetric shafts: a raymarch in a post pass
+
+Half resolution, 32 steps, ray start offset by a 4×4 Bayer pattern — that is the only
+thing that removes the banding without laying noise over the image. Upsampled
+bilaterally by depth.
+
+Each step samples the projected rose texture, so the shafts come out in different
+colours: a ruby beam separate from a cobalt one. Since the ray integral averages many
+glass cells toward white, there is a saturation control to pull them back apart.
+
+The breach light is marched alongside it, with **its own, nearly isotropic phase
+function**. A vertical shaft is almost always seen across its axis, where a
+forward-peaked phase gives essentially nothing — with `g = 0.65` the sideways
+scattering is forty times weaker than the forward peak, and the shaft was invisible
+until it got `g = 0.12` of its own.
+
+---
+
+## Everything else that is generated
+
+**Marble.** Domain-warped turbulence pushed through a sine: the zero crossings become
+the veins and the warp makes them wander. Two vein families at different angles, a
+broad tone underneath, fine speckle on top. Integer coefficients on `u` and `v` keep
+the sine periodic, so all three maps tile. One field pass feeds albedo, roughness and
+normal.
+
+It is mapped **triplanar in world space**. The building is made of lathes, extrusions
+and tube geometry, whose UVs are in three different conventions — projecting from
+world coordinates is what makes the veining run continuously from the floor up a
+column and across a rib. The relief is projected the same way; sampling it off the
+mesh UVs instead put the bumps somewhere else entirely, and at grazing angles the
+mismatch lit up as glowing cracks.
+
+**Geometry.** Clustered columns from `LatheGeometry` plus eight attached shafts,
+instanced. Two-centre pointed arches solved for the offset that puts the apex at
+1.15 × the half-span. A quadripartite vault whose ribs are half-arches — cubic
+Béziers that leave the springing vertically and arrive at the crown on a slope, which
+is what makes them read Gothic rather than Roman — and whose webs are Coons patches
+over those curves, with the `v = 1` edge collapsed onto the keystone.
+
+**The breach.** Cut through the web rather than a rib, because the web is the thin
+part and that is what actually falls in. The hole radius is modulated by angle so the
+edge is torn, not drilled, and the breached bay is tessellated finer so the tear
+reads. The daylight through it casts shadows, so the ragged edge shapes the beam.
+
+**Sound.** A convolution reverb whose impulse response is generated: twenty discrete
+early reflections off the arcade, then a four-second stone tail. Water is a narrow,
+low bed with sparse laps scheduled against it — a broad noise band reads as a beach,
+not a nave. Each drip impact triggers a plink at the moment the ripple is pushed into
+the water shader's buffer. Under the surface the whole master goes through a 420 Hz
+lowpass.
+
+A drop is *not* a falling pitch — that is a laser. What you hear is the bubble left
+behind by the impact, and as it shrinks its resonance goes **up**.
+
+**Life.** Sixty-four floating votive candles, nine drifting oak pews and nine bats,
+all solving the same wave equation as the surface. Drips off the vault, rain through
+the breach, and a wake behind you when you wade — everything feeds the same
+twelve-slot ripple buffer that the Gerstner shader reads.
+
+**The day.** Dusk → noon → dusk in ninety seconds, on a sine, so one loop of the
+camera is one loop of the light and the seam never shows. It drives six parameters
+together — colour temperature, intensity, sun height, ambient, daylight through the
+breach, and the candles *inversely*. It is applied over the panel's values rather
+than into them, so it never overwrites what you set.
+
+---
+
+![Dusk](screenshots/dusk.png)
+![The aisle](screenshots/aisle.png)
+![The breach](screenshots/breach.png)
+
+---
+
+## Running it
+
+Any static server — ES modules will not load over `file://`.
+
+```bash
+npx serve .
+```
+
+## Notes on the numbers
+
+Lights are in three.js's normalised range rather than real candela. Bloom runs
+before tone mapping, so its 0.85 threshold only means anything if scene radiance sits
+near 1.0; the alternative was crushing exposure to ~0.006 and blowing the bloom pass
+out entirely. Same picture, working bloom.
+
+Tone mapping is AgX, applied in `OutputPass`. The chain is exactly: volumetric
+composite → bloom → AgX → SMAA. No grain, no chromatic aberration, no vignette.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

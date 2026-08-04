@@ -1,0 +1,3010 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NAVIS</title>
+<style>
+  html,body{margin:0;height:100%;background:#05080b;overflow:hidden}
+  canvas{display:block}
+  #hud{position:fixed;left:14px;bottom:12px;font:11px/1.5 ui-monospace,Menlo,monospace;
+       color:#8a8378;letter-spacing:.14em;text-transform:uppercase;pointer-events:none;
+       opacity:.55;text-shadow:0 1px 2px #000}
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+        background:#05080b;color:#6f6a60;font:12px/1 ui-monospace,monospace;letter-spacing:.3em;
+        transition:opacity .6s ease;z-index:10;pointer-events:none}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="boot">NAVIS</div>
+<div id="hud"></div>
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+import Stats from 'three/addons/libs/stats.module.js';
+
+/* ═══════════════════════════════════════════════════════════════════
+   CONSTANTS — the whole art direction lives here, nothing is a setting
+   ═══════════════════════════════════════════════════════════════════ */
+const BAYS       = 7;
+const BAY        = 6.4;
+const NAVE_W     = 14;
+const ARCADE_H   = 12;
+const VAULT_H    = 21;
+const WATER_Y    = 4.2;
+const AISLE_W    = 5.0;
+const Z0         = -24;                    // west facade (rose) plane
+const Z1         = Z0 + BAYS * BAY;        // east end
+const ROSE_C     = new THREE.Vector3(0, 15, Z0);
+const ROSE_R     = 4.6;
+
+const GLASS = {
+  cobalt:   '#1e3f8f',
+  ruby:     '#8e1622',
+  emerald:  '#166b4c',
+  amber:    '#c98a2e',
+  manganese:'#4b2c6d',
+  white:    '#e8d9b0'
+};
+
+const STONE_DRY = 0xb8ae9c;
+const STONE_WET = 0x5a5449;
+
+/* The breach. Sited in the middle of a web panel rather than on a rib,
+   because the web is the thin part — that is what actually falls in.
+   Everything else keyed off it: the daylight, the rain, the rubble. */
+const BREACH = { x: -4.3, z: -7.4, r: 2.45 };
+const breachRadius = (dx, dz) => {          // ragged, not a drilled circle
+  const a = Math.atan2(dz, dx);
+  return BREACH.r * (0.80 + 0.20 * Math.sin(a * 3.1 + 0.7)
+                          + 0.10 * Math.sin(a * 7.3 + 2.1));
+};
+const inBreach = (x, z) => {
+  const dx = x - BREACH.x, dz = z - BREACH.z;
+  return dx * dx + dz * dz < Math.pow(breachRadius(dx, dz), 2);
+};
+
+const RENDER_LAYER = 0;   // everything
+const REFLECT_LAYER = 1;  // cheap subset drawn into the mirror
+const WATER_LAYER  = 2;   // drawn last, so it can refract what is behind it
+
+/* ═══════════════════════════════════════════════════════════════════
+   RENDERER / SCENE / CAMERA
+   ═══════════════════════════════════════════════════════════════════ */
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x0a2836, 0.0);
+
+const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 220);
+camera.position.set(0, 4.4, 14);
+
+const hemi = new THREE.HemisphereLight(0x2a3348, 0x1a1512, 0.35);
+scene.add(hemi);
+
+// shared clock-driven uniform, handed to every custom material
+const uTime = { value: 0 };
+
+/* The four Gerstner waves, in one place. The GLSL constants are written
+   out of this array, so anything floating on the surface is solving the
+   same equation the vertex shader does — no drift between them.     */
+const WAVES = [
+  [ 0.92,  0.39, 8.0, 0.055],
+  [-0.41,  0.91, 5.1, 0.038],
+  [ 0.71, -0.70, 2.9, 0.021],
+  [-0.86, -0.51, 1.8, 0.011]
+];
+const WAVE_GLSL = WAVES
+  .map((w, i) => `const vec4 W${i} = vec4(${w.map(v => v.toFixed(3)).join(', ')});`)
+  .join('\n    ');
+
+// height and slope of the surface at a world point — for floating things
+const waveAt = (() => {
+  const G = 9.81;
+  return (x, z, t, ampMul = 1, steepMul = 1) => {
+    let y = 0, nx = 0, nz = 0;
+    for (const [dx, dz, len, amp0] of WAVES) {
+      const l = Math.hypot(dx, dz), ux = dx / l, uz = dz / l;
+      const k = (Math.PI * 2) / len, a = amp0 * ampMul;
+      const om = Math.sqrt(G * k);
+      const ph = k * (ux * x + uz * z) - om * t;
+      y += a * Math.sin(ph);
+      const wa = k * a;
+      nx -= ux * wa * Math.cos(ph);
+      nz -= uz * wa * Math.cos(ph);
+    }
+    return { y, nx, nz };
+  };
+})();
+
+/* ═══════════════════════════════════════════════════════════════════
+   TEXTURES — everything drawn to a canvas once, at load
+   ═══════════════════════════════════════════════════════════════════ */
+function makeCanvas(s) {
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  return c;
+}
+function blurCanvas(src, px) {
+  const out = makeCanvas(src.width);
+  const g = out.getContext('2d');
+  g.filter = `blur(${px}px)`;
+  g.drawImage(src, 0, 0);
+  return out;
+}
+
+/* ── 1. The rose window ────────────────────────────────────────────
+   12-fold radial symmetry. Oculus, trefoils, lancets, outer rosettes.
+   Mullions in black; the black surround is what makes the shafts
+   read as separate beams instead of one cone of light.            */
+function makeRoseTexture() {
+  const S = 2048, R = S / 2, cv = makeCanvas(S), g = cv.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
+  g.translate(R, R);
+
+  const petalOf = i => {                     // 12 sectors, ruby+amber aimed low
+    const a = (i / 12) * Math.PI * 2 - Math.PI / 2;   // sector direction
+    const down = Math.sin(a);                          // +1 = straight down
+    if (down > 0.55) return GLASS.ruby;
+    if (down > 0.10) return i & 1 ? GLASS.amber : GLASS.ruby;
+    if (down > -0.45) return i & 1 ? GLASS.cobalt : GLASS.emerald;
+    return i & 1 ? GLASS.cobalt : GLASS.manganese;
+  };
+
+  const wedge = (r0, r1, a0, a1, fill) => {
+    g.beginPath();
+    g.arc(0, 0, r1, a0, a1);
+    g.arc(0, 0, r0, a1, a0, true);
+    g.closePath();
+    g.fillStyle = fill; g.fill();
+  };
+  const disc = (x, y, r, fill) => {
+    g.beginPath(); g.arc(x, y, r, 0, 7); g.fillStyle = fill; g.fill();
+  };
+  const ring = (r, w) => {
+    g.beginPath(); g.arc(0, 0, r, 0, 7);
+    g.lineWidth = w; g.strokeStyle = '#000'; g.stroke();
+  };
+
+  // glass field, drawn outward: oculus → lancets → trefoils → rosettes
+  disc(0, 0, 0.175 * R, GLASS.amber);
+  for (let i = 0; i < 6; i++) {                     // oculus flower
+    const a = i / 6 * Math.PI * 2;
+    disc(Math.cos(a) * 0.095 * R, Math.sin(a) * 0.095 * R, 0.055 * R, GLASS.white);
+  }
+  disc(0, 0, 0.05 * R, GLASS.ruby);
+
+  const TAU = Math.PI * 2;
+  for (let i = 0; i < 12; i++) {
+    const a0 = (i / 12) * TAU - Math.PI / 2, a1 = a0 + TAU / 12;
+    const mid = (a0 + a1) / 2;
+    const col = petalOf(i);
+
+    // lancet band
+    wedge(0.20 * R, 0.455 * R, a0 + 0.012, a1 - 0.012, col);
+    wedge(0.20 * R, 0.26 * R, a0 + 0.012, a1 - 0.012, GLASS.white);
+
+    // trefoil, three lobes on a circle
+    const tx = Math.cos(mid) * 0.585 * R, ty = Math.sin(mid) * 0.585 * R;
+    const tc = i % 3 === 0 ? GLASS.emerald : (petalOf(i) === GLASS.ruby ? GLASS.amber : GLASS.ruby);
+    disc(tx, ty, 0.105 * R, col === GLASS.cobalt ? GLASS.cobalt : GLASS.manganese);
+    for (let k = 0; k < 3; k++) {
+      const a = mid + k / 3 * TAU + Math.PI / 6;
+      disc(tx + Math.cos(a) * 0.052 * R, ty + Math.sin(a) * 0.052 * R, 0.05 * R, tc);
+    }
+
+    // outer band + two rosettes per sector
+    wedge(0.70 * R, 0.845 * R, a0 + 0.014, a1 - 0.014, i & 1 ? GLASS.cobalt : col);
+    for (let k = 0; k < 2; k++) {
+      const a = a0 + (k + 0.5) * (TAU / 24);
+      disc(Math.cos(a) * 0.775 * R, Math.sin(a) * 0.775 * R, 0.048 * R,
+           k ? GLASS.amber : GLASS.white);
+    }
+  }
+
+  // stone: radial mullions, concentric rings, outer wall
+  g.lineCap = 'butt';
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * TAU - Math.PI / 2;
+    g.save(); g.rotate(a);
+    g.fillStyle = '#000';
+    g.fillRect(0.16 * R, -0.0125 * R, 0.70 * R, 0.025 * R);
+    g.restore();
+  }
+  for (let i = 0; i < 24; i++) {
+    const a = (i / 24) * TAU - Math.PI / 2 + TAU / 48;
+    g.save(); g.rotate(a);
+    g.fillStyle = '#000';
+    g.fillRect(0.68 * R, -0.008 * R, 0.19 * R, 0.016 * R);
+    g.restore();
+  }
+  ring(0.185 * R, 0.030 * R);
+  ring(0.20 * R, 0.016 * R);
+  ring(0.462 * R, 0.026 * R);
+  ring(0.70 * R, 0.024 * R);
+  ring(0.855 * R, 0.05 * R);
+
+  g.globalCompositeOperation = 'destination-in';     // kill everything outside
+  g.beginPath(); g.arc(0, 0, 0.87 * R, 0, 7); g.fill();
+  g.globalCompositeOperation = 'source-over';
+
+  const tex = new THREE.CanvasTexture(blurCanvas(cv, 2));
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/* ── 2. Caustics ───────────────────────────────────────────────────
+   Three tileable Voronoi layers multiplied. The F2−F1 ridge term is
+   what gives the thin filaments; the F1 blob alone reads as bubbles. */
+function makeCausticsTexture() {
+  const S = 512, cv = makeCanvas(S), g = cv.getContext('2d');
+  const img = g.createImageData(S, S), d = img.data;
+  const hash = (x, y, s) => {
+    let h = (x * 374761393 + y * 668265263 + s * 2147483647) | 0;
+    h = (h ^ (h >> 13)) * 1274126177 | 0;
+    return ((h ^ (h >> 16)) >>> 0) / 4294967296;
+  };
+  const layer = (u, v, n, seed) => {           // n cells per axis → tiles
+    const fx = u * n, fy = v * n;
+    const ix = Math.floor(fx), iy = Math.floor(fy);
+    let f1 = 9, f2 = 9;
+    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+      const cx = ix + ox, cy = iy + oy;
+      const wx = ((cx % n) + n) % n, wy = ((cy % n) + n) % n;
+      const px = cx + hash(wx, wy, seed), py = cy + hash(wx, wy, seed + 17);
+      const dx = px - fx, dy = py - fy, dd = Math.sqrt(dx * dx + dy * dy);
+      if (dd < f1) { f2 = f1; f1 = dd; } else if (dd < f2) { f2 = dd; }
+    }
+    const ridge = 1 - Math.min(1, (f2 - f1) * 7.0);   // thin bright web
+    const blob  = Math.max(0, 1 - f1 * 1.35);
+    return Math.min(1, ridge * 0.85 + blob * 0.45);
+  };
+  const buf = new Float32Array(S * S);
+  let max = 0;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S;
+    const c = layer(u, v, 6, 1) * layer(u, v, 10, 2) * layer(u, v, 17, 3);
+    buf[y * S + x] = c;
+    if (c > max) max = c;
+  }
+  // the product of three layers is nearly black on average; lift it so
+  // the shader's own pow() still has something to work with
+  for (let i = 0; i < S * S; i++) {
+    const v = Math.min(255, Math.pow(buf[i] / max, 0.45) * 255) | 0;
+    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(blurCanvas(cv, 1));
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.NoColorSpace;
+  return tex;
+}
+
+/* ── 3. Stone: three octaves of tileable value noise → normal map ── */
+function makeStoneNormal() {
+  const S = 512, cv = makeCanvas(S), g = cv.getContext('2d');
+  const img = g.createImageData(S, S), d = img.data;
+  const h2 = (x, y, s) => {
+    let h = (x * 1597334677 + y * 3812015801 + s * 982451653) | 0;
+    h = (h ^ (h >> 15)) * 2246822519 | 0;
+    return ((h ^ (h >> 13)) >>> 0) / 4294967296;
+  };
+  const sm = t => t * t * (3 - 2 * t);
+  const vnoise = (u, v, n, s) => {
+    const fx = u * n, fy = v * n;
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = sm(fx - x0), ty = sm(fy - y0);
+    const w = (a, b) => h2(((a % n) + n) % n, ((b % n) + n) % n, s);
+    return (w(x0, y0) * (1 - tx) + w(x0 + 1, y0) * tx) * (1 - ty)
+         + (w(x0, y0 + 1) * (1 - tx) + w(x0 + 1, y0 + 1) * tx) * ty;
+  };
+  const field = new Float32Array(S * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S;
+    field[y * S + x] = vnoise(u, v, 8, 1) * 0.6 + vnoise(u, v, 24, 2) * 0.28
+                     + vnoise(u, v, 71, 3) * 0.12;
+  }
+  const at = (x, y) => field[(((y % S) + S) % S) * S + (((x % S) + S) % S)];
+  const st = 2.2;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const dx = (at(x + 1, y) - at(x - 1, y)) * st;
+    const dy = (at(x, y + 1) - at(x, y - 1)) * st;
+    const l = Math.hypot(dx, dy, 1), i = (y * S + x) * 4;
+    d[i]     = ((-dx / l) * 0.5 + 0.5) * 255;
+    d[i + 1] = ((-dy / l) * 0.5 + 0.5) * 255;
+    d[i + 2] = ((1 / l) * 0.5 + 0.5) * 255;
+    d[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.NoColorSpace;
+  return tex;
+}
+
+/* ── 3b. Lancet windows ────────────────────────────────────────────
+   The rose is the key light; these are the side fill. Same rules as
+   the rose: stone in black, glass from the palette, nothing saturated.
+   Two lights under a pointed head, a quarry field of leaded diamonds,
+   a coloured medallion in each light, borders top and bottom.     */
+function makeLancetTexture(W, H, pal, seed = 0) {
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  let rs = seed * 9301 + 49297;
+  const rnd = () => (rs = (rs * 9301 + 49297) % 233280) / 233280;
+
+  g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+
+  // the opening: a two-centre arch over a rectangle
+  const m = W * 0.045, w = W - m * 2, x0 = m, x1 = W - m;
+  const spring = H * 0.40, headTop = H * 0.018;
+  const arch = (inset) => {
+    const a = x0 + inset, b = x1 - inset, hw = (b - a) / 2, cx = (a + b) / 2;
+    const rise = spring - headTop - inset;
+    const e = Math.max(0.01, (rise * rise - hw * hw) / (2 * hw)), R = hw + e;
+    // canvas y grows downward, so the apex is at a negative angle
+    g.beginPath();
+    g.moveTo(a, H - m + inset);
+    g.lineTo(a, spring);
+    g.arc(cx + e, spring, R, Math.PI, Math.atan2(-rise, -e), false);
+    g.arc(cx - e, spring, R, Math.atan2(-rise, e), 0, false);
+    g.lineTo(b, H - m + inset);
+    g.closePath();
+  };
+
+  arch(0); g.fillStyle = pal.field; g.fill();
+
+  // leaded quarry field: diamonds on the diagonal, faintly varied
+  g.save(); arch(W * 0.045); g.clip();
+  const q = W * 0.115;
+  for (let y = -q; y < H + q; y += q) for (let x = -q; x < W + q; x += q) {
+    g.beginPath();
+    g.moveTo(x, y - q / 2); g.lineTo(x + q / 2, y);
+    g.lineTo(x, y + q / 2); g.lineTo(x - q / 2, y);
+    g.closePath();
+    g.fillStyle = rnd() < 0.16 ? pal.accent : (rnd() < 0.5 ? pal.field : pal.field2);
+    g.fill();
+    g.lineWidth = W * 0.008; g.strokeStyle = 'rgba(0,0,0,.62)'; g.stroke();
+  }
+  // a medallion in each of the two lights
+  for (let k = 0; k < 2; k++) {
+    const cx = W * (k ? 0.655 : 0.345), cy = H * 0.66, r = W * 0.135;
+    g.beginPath(); g.arc(cx, cy, r, 0, 7);
+    g.fillStyle = pal.medal; g.fill();
+    g.lineWidth = W * 0.026; g.strokeStyle = '#000'; g.stroke();
+    for (let i = 0; i < 4; i++) {
+      const a = i / 4 * Math.PI * 2 + 0.78;
+      g.beginPath();
+      g.arc(cx + Math.cos(a) * r * 0.46, cy + Math.sin(a) * r * 0.46, r * 0.34, 0, 7);
+      g.fillStyle = i & 1 ? pal.accent : pal.hot; g.fill();
+    }
+    g.beginPath(); g.arc(cx, cy, r * 0.26, 0, 7);
+    g.fillStyle = pal.hot; g.fill();
+  }
+  // trefoil in the head
+  for (let i = 0; i < 3; i++) {
+    const a = i / 3 * Math.PI * 2 - Math.PI / 2;
+    g.beginPath();
+    g.arc(W * 0.5 + Math.cos(a) * W * 0.085, H * 0.235 + Math.sin(a) * W * 0.085, W * 0.078, 0, 7);
+    g.fillStyle = i === 0 ? pal.hot : pal.accent; g.fill();
+  }
+  // banded borders top and bottom
+  g.fillStyle = pal.band;
+  g.fillRect(x0, H * 0.86, w, H * 0.045);
+  g.fillRect(x0, H * 0.505, w, H * 0.028);
+  g.restore();
+
+  // stone: central mullion, transom, and the outer reveal
+  g.fillStyle = '#000';
+  g.fillRect(W * 0.478, H * 0.30, W * 0.044, H * 0.70);
+  g.fillRect(x0, H * 0.845, w, H * 0.016);
+  g.lineWidth = W * 0.075; g.strokeStyle = '#000';
+  arch(0); g.stroke();
+  g.lineWidth = W * 0.022;
+  arch(W * 0.045); g.stroke();
+
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const go = out.getContext('2d');
+  go.filter = 'blur(1.1px)';
+  go.drawImage(cv, 0, 0);
+  const tex = new THREE.CanvasTexture(out);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/* ── 4. Marble ─────────────────────────────────────────────────────
+   Domain-warped turbulence pushed through a sine, which is the classic
+   way to get calcite veining: the sine's zero crossings become the
+   veins and the warp makes them wander. Two vein families at different
+   angles, a broad tone underneath, fine speckle on top. Everything is
+   built on a wrapped lattice, so all three maps tile.
+   One field pass feeds albedo, roughness and normal.               */
+function marbleSampler(seed, o = {}) {
+  /* Real marble is mostly field with soft, wide veining. Narrow bright
+     filaments are what make procedural marble look like cracked glass,
+     so the calcite sits close to the base value and the character comes
+     from the darker seams instead.                                  */
+  const base  = o.base  || [0.800, 0.766, 0.700];
+  const shade = o.shade || [0.632, 0.594, 0.523];
+  const vein  = o.vein  || [0.852, 0.836, 0.790];
+  const dark  = o.dark  || [0.398, 0.368, 0.318];
+  const warp  = o.warp ?? 0.30;
+  const amt   = o.veinAmt ?? 0.55;
+
+  const hash = (x, y, s) => {
+    let h = (x * 1597334677 + y * 3812015801 + s * 982451653) | 0;
+    h = (h ^ (h >> 15)) * 2246822519 | 0;
+    return ((h ^ (h >> 13)) >>> 0) / 4294967296;
+  };
+  const sm = t => t * t * (3 - 2 * t);
+  const vn = (u, v, n, s) => {
+    const fx = u * n, fy = v * n;
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = sm(fx - x0), ty = sm(fy - y0);
+    const w = (a, b) => hash(((a % n) + n) % n, ((b % n) + n) % n, s);
+    return (w(x0, y0) * (1 - tx) + w(x0 + 1, y0) * tx) * (1 - ty)
+         + (w(x0, y0 + 1) * (1 - tx) + w(x0 + 1, y0 + 1) * tx) * ty;
+  };
+  const fbm = (u, v, n, s, oct) => {
+    let a = 0.5, f = n, sum = 0, norm = 0;
+    for (let i = 0; i < oct; i++) { sum += a * vn(u, v, f, s + i * 37); norm += a; a *= 0.5; f *= 2; }
+    return sum / norm;
+  };
+  const TAU = Math.PI * 2;
+
+  // integer coefficients on u and v keep the sine periodic → seamless
+  return (u, v) => {
+    const wx = u + (fbm(u, v, 3, seed, 4) - 0.5) * warp;
+    const wy = v + (fbm(u, v, 3, seed + 101, 4) - 0.5) * warp;
+    const t = fbm(wx, wy, 4, seed + 7, 5);
+    const s1 = Math.sin(TAU * (3 * wx + 1 * wy + t * 2.30));
+    const s2 = Math.sin(TAU * (1 * wx - 2 * wy + t * 1.55) + 1.7);
+    // wide, soft veins read as marble; thin bright filaments read as
+    // lightning the moment the surface is over-lit
+    const v1 = Math.pow(1 - Math.abs(s1), 2.2);        // calcite, broad
+    const v2 = Math.pow(1 - Math.abs(s2), 7.0);        // dark seams
+    const broad = fbm(u, v, 2, seed + 55, 3);
+    const grain = fbm(u, v, 48, seed + 71, 2) - 0.5;
+
+    const c = [0, 0, 0];
+    for (let i = 0; i < 3; i++) {
+      let x = shade[i] + (base[i] - shade[i]) * broad;
+      x += (dark[i] - x) * v2 * amt * 0.82;
+      x += (vein[i] - x) * v1 * amt;
+      c[i] = Math.max(0, Math.min(1, x + grain * 0.055));
+    }
+    // polished stone: the veins take a slightly better polish
+    const rough = Math.max(0.05, Math.min(1,
+      0.62 + (broad - 0.5) * 0.20 - v1 * 0.16 + v2 * 0.10 + grain * 0.06));
+    const height = broad * 0.55 + v1 * 0.40 - v2 * 0.55 + grain * 0.35;
+    return { r: c[0], g: c[1], b: c[2], rough, height };
+  };
+}
+
+function makeMarbleMaps(S, seed, opts) {
+  const sample = marbleSampler(seed, opts);
+  const alb = makeCanvas(S), rgh = makeCanvas(S), nrm = makeCanvas(S);
+  const ga = alb.getContext('2d'), gr = rgh.getContext('2d'), gn = nrm.getContext('2d');
+  const ia = ga.createImageData(S, S), ir = gr.createImageData(S, S), inr = gn.createImageData(S, S);
+  const H = new Float32Array(S * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const s = sample(x / S, y / S), i = (y * S + x) * 4;
+    ia.data[i] = s.r * 255; ia.data[i + 1] = s.g * 255; ia.data[i + 2] = s.b * 255; ia.data[i + 3] = 255;
+    const q = s.rough * 255;
+    ir.data[i] = ir.data[i + 1] = ir.data[i + 2] = q; ir.data[i + 3] = 255;
+    H[y * S + x] = s.height;
+  }
+  const at = (x, y) => H[(((y % S) + S) % S) * S + (((x % S) + S) % S)];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const dx = (at(x + 1, y) - at(x - 1, y)) * 2.6;
+    const dy = (at(x, y + 1) - at(x, y - 1)) * 2.6;
+    const l = Math.hypot(dx, dy, 1), i = (y * S + x) * 4;
+    inr.data[i] = ((-dx / l) * 0.5 + 0.5) * 255;
+    inr.data[i + 1] = ((-dy / l) * 0.5 + 0.5) * 255;
+    inr.data[i + 2] = ((1 / l) * 0.5 + 0.5) * 255;
+    inr.data[i + 3] = 255;
+  }
+  ga.putImageData(ia, 0, 0); gr.putImageData(ir, 0, 0); gn.putImageData(inr, 0, 0);
+
+  const tex = (cv, srgb) => {
+    const t = new THREE.CanvasTexture(cv);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    t.anisotropy = 8;
+    return t;
+  };
+  return { albedo: tex(alb, true), rough: tex(rgh, false), normal: tex(nrm, false) };
+}
+
+/* ── 5. Floor: marble checkerboard, two stones, one 2×2 tile ─────── */
+function makeFloorTexture() {
+  const S = 512, cv = makeCanvas(S), g = cv.getContext('2d');
+  const img = g.createImageData(S, S), d = img.data, h = S / 2;
+  // two stones cut from the same quarry: a pale and a near-black marble
+  const pale = marbleSampler(21, {
+    base: [0.700, 0.668, 0.607], shade: [0.545, 0.515, 0.458],
+    vein: [0.815, 0.795, 0.742], dark: [0.352, 0.330, 0.290],
+    warp: 0.26, veinAmt: 0.52
+  });
+  const dk = marbleSampler(34, {
+    base: [0.268, 0.258, 0.243], shade: [0.176, 0.172, 0.168],
+    vein: [0.455, 0.446, 0.420], dark: [0.108, 0.108, 0.112],
+    warp: 0.34, veinAmt: 0.55
+  });
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const cx = x < h ? 0 : 1, cy = y < h ? 0 : 1;
+    // each tile samples its own patch of stone, so no two repeat
+    const u = ((x % h) / h) * 0.5 + cx * 0.31, v = ((y % h) / h) * 0.5 + cy * 0.47;
+    const s = ((cx + cy) & 1) ? pale(u, v) : dk(u, v);
+    const e = Math.min(x % h, y % h, h - 1 - (x % h), h - 1 - (y % h));
+    const joint = e < 3 ? 0.52 + e * 0.16 : 1.0;      // cut joints between slabs
+    const i = (y * S + x) * 4;
+    d[i] = s.r * 255 * joint; d[i + 1] = s.g * 255 * joint; d[i + 2] = s.b * 255 * joint;
+    d[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  return tex;
+}
+
+const roseTex     = makeRoseTexture();
+const causticsTex = makeCausticsTexture();
+const stoneNormal = makeStoneNormal();
+const marble      = makeMarbleMaps(512, 3);
+const floorTex    = makeFloorTexture();
+// aisle: warm greens and amber, low down and close to the eye
+const aisleGlassTex = makeLancetTexture(384, 576, {
+  field: GLASS.emerald, field2: '#14513a', accent: GLASS.amber,
+  medal: GLASS.ruby, hot: GLASS.white, band: GLASS.manganese
+}, 3);
+// clerestory: cold blues, read against the dark of the vault
+const clereGlassTex = makeLancetTexture(384, 576, {
+  field: GLASS.cobalt, field2: '#18306b', accent: GLASS.white,
+  medal: GLASS.manganese, hot: GLASS.amber, band: GLASS.ruby
+}, 11);
+stoneNormal.repeat.set(2, 2);
+marble.normal.repeat.set(3, 3);
+
+/* ═══════════════════════════════════════════════════════════════════
+   STONE MATERIAL — waterline darkening + caustics, injected into
+   MeshStandardMaterial. The caustic tint is read back out of the rose
+   projection, so a ruby shaft lays down ruby caustics.
+   ═══════════════════════════════════════════════════════════════════ */
+const proj = {
+  uSpotMat:    { value: new THREE.Matrix4() },
+  uSpotMap:    { value: roseTex },
+  uSpotShadow: { value: null },
+  uCaustics:   { value: causticsTex },
+  uWaterY:     { value: WATER_Y },
+  uCaustic:    { value: new THREE.Vector3(2.2, 1.0, 1.0) },  // gain, scale, speed
+  uMarble:     { value: marble.albedo },
+  uMarbleR:    { value: marble.rough },
+  uMarbleN:    { value: marble.normal },
+  uStone:      { value: new THREE.Vector3(0.28, 1.0, 0.35) }, // scale, rough ×, relief
+  uTime
+};
+
+const PROJ_PARS = /* glsl */`
+  uniform mat4      uSpotMat;
+  uniform sampler2D uSpotMap;
+  uniform sampler2D uSpotShadow;
+  uniform sampler2D uCaustics;
+  uniform sampler2D uMarble;
+  uniform sampler2D uMarbleR;
+  uniform sampler2D uMarbleN;
+  uniform float     uWaterY;
+  uniform vec3      uCaustic;
+  uniform vec3      uStone;
+  uniform float     uTime;
+  varying vec3 vWPos;
+  varying vec3 vWNrm;
+
+  /* Triplanar, in world space. The building mixes lathes, extrusions and
+     tube geometry, whose UVs are in three different conventions — mapping
+     the marble off those would stretch it differently on every part.
+     Projected from world coordinates the veining is continuous from the
+     floor up a column and across a rib.                              */
+  vec3 triplanar(sampler2D tex, vec3 wp, vec3 n, float sc) {
+    vec3 b = abs(n); b = b * b * b;
+    b /= max(b.x + b.y + b.z, 1e-4);
+    vec3 c = vec3(0.0);
+    if (b.x > 0.004) c += texture2D(tex, wp.zy * sc).rgb * b.x;
+    if (b.y > 0.004) c += texture2D(tex, wp.xz * sc).rgb * b.y;
+    if (b.z > 0.004) c += texture2D(tex, wp.xy * sc).rgb * b.z;
+    return c;
+  }
+
+  /* The relief has to be projected the same way the colour is. Sampling
+     it off the mesh UVs instead put the bumps somewhere else entirely,
+     and at grazing angles the mismatch lit up as glowing cracks.
+     Whiteout blend: fold the geometric normal into each projection
+     before mixing, so the result stays stable on curved surfaces.  */
+  vec3 triplanarNormal(sampler2D tex, vec3 wp, vec3 n, float sc, float amt) {
+    vec3 b = abs(n); b = b * b * b;
+    b /= max(b.x + b.y + b.z, 1e-4);
+    vec3 nx = texture2D(tex, wp.zy * sc).xyz * 2.0 - 1.0;
+    vec3 ny = texture2D(tex, wp.xz * sc).xyz * 2.0 - 1.0;
+    vec3 nz = texture2D(tex, wp.xy * sc).xyz * 2.0 - 1.0;
+    nx.xy *= amt; ny.xy *= amt; nz.xy *= amt;
+    nx = vec3(nx.xy + n.zy, abs(nx.z) * n.x);
+    ny = vec3(ny.xy + n.xz, abs(ny.z) * n.y);
+    nz = vec3(nz.xy + n.xy, abs(nz.z) * n.z);
+    return normalize(nx.zyx * b.x + ny.xzy * b.y + nz.xyz * b.z);
+  }
+
+  // colour of the rose projection at a world point, already occluded
+  vec3 roseAt(vec3 wp) {
+    vec4 sp = uSpotMat * vec4(wp, 1.0);
+    if (sp.w <= 0.0) return vec3(0.0);
+    vec3 c = sp.xyz / sp.w;
+    if (any(lessThan(c.xy, vec2(0.001))) || any(greaterThan(c.xy, vec2(0.999)))) return vec3(0.0);
+    float sd  = unpackRGBAToDepth(texture2D(uSpotShadow, c.xy));
+    float vis = step(c.z - 0.0022, sd);
+    return texture2D(uSpotMap, c.xy).rgb * vis;
+  }
+
+  // two scrolling layers so the pattern never visibly loops
+  float causticAmp(vec2 wxz) {
+    float t = uTime * uCaustic.z;
+    vec2 s = wxz * uCaustic.y;
+    float c = texture2D(uCaustics, s * 0.25 + t * vec2( 0.014, 0.009)).r
+            * texture2D(uCaustics, s * 0.41 - t * vec2( 0.011, 0.017)).r;
+    return pow(c, 0.75) * uCaustic.x;   // two dark layers multiplied: lift, don't crush
+  }
+
+  // clamped to below the surface and to upward-facing normals, or it
+  // crawls up the columns
+  vec3 causticLight(vec3 wp, vec3 wn) {
+    float below = smoothstep(0.0, 0.45, uWaterY - wp.y);
+    float up    = smoothstep(0.05, 0.55, wn.y);
+    if (below * up <= 0.001) return vec3(0.0);
+    float depthFade = exp(-(uWaterY - wp.y) * 0.30);
+    return causticAmp(wp.xz) * roseAt(wp) * (below * up * depthFade);
+  }
+`;
+
+const PROJ_VERT = /* glsl */`
+  varying vec3 vWPos;
+  varying vec3 vWNrm;
+`;
+
+function injectStone(mat, { caustics = true, marble = false } = {}) {
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, proj);
+    sh.vertexShader = PROJ_VERT + sh.vertexShader;
+    sh.vertexShader = sh.vertexShader.replace('#include <project_vertex>', /* glsl */`
+      #include <project_vertex>
+      vec4 wp4 = vec4(transformed, 1.0);
+      vec3 wn3 = objectNormal;
+      #ifdef USE_INSTANCING
+        wp4 = instanceMatrix * wp4;
+        wn3 = mat3(instanceMatrix) * wn3;
+      #endif
+      vWPos = (modelMatrix * wp4).xyz;
+      vWNrm = normalize(mat3(modelMatrix) * wn3);
+    `);
+    // after <packing>, so unpackRGBAToDepth is already declared
+    sh.fragmentShader = sh.fragmentShader.replace('void main() {', PROJ_PARS + '\nvoid main() {');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <map_fragment>', /* glsl */`
+      #include <map_fragment>
+      ${marble ? 'diffuseColor.rgb *= triplanar(uMarble, vWPos, normalize(vWNrm), uStone.x);' : ''}
+      float wet = 1.0 - smoothstep(uWaterY - 0.30, uWaterY + 0.40, vWPos.y);
+      float tide = exp(-pow((vWPos.y - uWaterY - 0.22) * 5.5, 2.0));
+      diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(0.40,0.42,0.40), wet);
+      diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.085,0.098,0.070), tide * 0.55);
+    `);
+    if (marble) {
+      sh.fragmentShader = sh.fragmentShader.replace('#include <normal_fragment_maps>', /* glsl */`
+        #include <normal_fragment_maps>
+        {
+          vec3 wn = triplanarNormal(uMarbleN, vWPos, normalize(vWNrm), uStone.x, uStone.z);
+          normal = normalize((viewMatrix * vec4(wn, 0.0)).xyz);
+        }
+      `);
+    }
+    sh.fragmentShader = sh.fragmentShader.replace('#include <roughnessmap_fragment>', /* glsl */`
+      #include <roughnessmap_fragment>
+      ${marble ? 'roughnessFactor *= triplanar(uMarbleR, vWPos, normalize(vWNrm), uStone.x).r * uStone.y;' : ''}
+      roughnessFactor = mix(roughnessFactor, 0.25, wet);
+    `);
+    if (caustics) {
+      sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', /* glsl */`
+        #include <opaque_fragment>
+        gl_FragColor.rgb += causticLight(vWPos, normalize(vWNrm)) * diffuseColor.rgb * 2.4;
+      `);
+    }
+  };
+  mat.customProgramCacheKey = () => 'navis-stone' + (caustics ? '-c' : '') + (marble ? '-m' : '');
+  return mat;
+}
+
+// no normalMap: the marble materials do their relief triplanar instead
+const matStone = injectStone(new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 1.0, metalness: 0.0
+}), { marble: true });
+
+const matFloor = injectStone(new THREE.MeshStandardMaterial({
+  map: floorTex, color: 0xffffff, roughness: 0.62, metalness: 0.0,
+  normalMap: marble.normal, normalScale: new THREE.Vector2(0.35, 0.35)
+}));
+
+const matVault = injectStone(new THREE.MeshStandardMaterial({
+  color: 0xcfc6b6, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide
+}), { caustics: false, marble: true });
+
+/* ═══════════════════════════════════════════════════════════════════
+   GEOMETRY — clustered columns and pointed arches
+   ═══════════════════════════════════════════════════════════════════ */
+const SPRING    = 8.3;                    // arch springing height
+const RISEK     = 1.15;                   // pointed-arch rise coefficient
+const ARCH_SPAN = 5.3;                    // clear opening between columns
+const WALL_TOP  = 15.5;                   // where the vault springs
+const AISLE_TOP = 12.4;
+
+function clusteredColumnGeometry() {
+  const p = [
+    [0.00, 0.00], [0.98, 0.00], [0.98, 0.30], [0.86, 0.42], [0.70, 0.70],
+    [0.62, 1.05], [0.57, 1.60], [0.55, 7.30], [0.60, 7.50], [0.78, 7.95],
+    [0.92, 8.16], [0.92, 8.30], [0.72, 8.44], [0.72, 8.62], [0.00, 8.62]
+  ].map(([x, y]) => new THREE.Vector2(x, y));
+  const parts = [new THREE.LatheGeometry(p, 20)];
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    const h = 6.35;
+    const g = new THREE.CylinderGeometry(0.175, 0.175, h, 8, 1);
+    g.translate(0, 1.15 + h / 2, 0);
+    g.rotateY(-a);
+    g.translate(Math.cos(a) * 0.66, 0, Math.sin(a) * 0.66);
+    parts.push(g);
+    const cap = new THREE.CylinderGeometry(0.26, 0.20, 0.55, 8, 1);
+    cap.translate(Math.cos(a) * 0.70, 7.78, Math.sin(a) * 0.70);
+    parts.push(cap);
+    const bs = new THREE.CylinderGeometry(0.24, 0.30, 0.55, 8, 1);
+    bs.translate(Math.cos(a) * 0.70, 0.88, Math.sin(a) * 0.70);
+    parts.push(bs);
+  }
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/* two-centre pointed arch: solve the offset that puts the apex at
+   RISEK × half-span, then trace intrados and extrados                */
+function pointedArchShape(span, thick, riseK = RISEK) {
+  const h = span / 2;
+  const rise = riseK * h;
+  const e  = (rise * rise - h * h) / (2 * h);     // centre offset
+  const R  = h + e;
+  const aL = Math.atan2(rise, -e);                // apex angle, left centre
+  const aR = Math.atan2(rise,  e);                // apex angle, right centre
+  const s = new THREE.Shape();
+  s.moveTo(-h, 0);
+  s.absarc( e, 0, R, Math.PI, aL, true);
+  s.absarc(-e, 0, R, aR, 0, true);
+  s.lineTo(h + thick, 0);
+  s.absarc(-e, 0, R + thick, 0, aR, false);
+  s.absarc( e, 0, R + thick, aL, Math.PI, false);
+  s.lineTo(-h, 0);
+  return { shape: s, rise, apex: rise };
+}
+
+function archGeometry(span, thick, depth) {
+  const { shape } = pointedArchShape(span, thick);
+  const g = new THREE.ExtrudeGeometry(shape, {
+    depth, bevelEnabled: true, bevelThickness: 0.05, bevelSize: 0.05,
+    bevelSegments: 1, curveSegments: 22
+  });
+  g.translate(0, 0, -depth / 2);
+  return g;
+}
+
+// ── columns: two arcades, one per side, BAYS+1 columns each ────────
+const colGeo = clusteredColumnGeometry();
+const columns = new THREE.InstancedMesh(colGeo, matStone, (BAYS + 1) * 2);
+columns.castShadow = columns.receiveShadow = true;
+{
+  const m = new THREE.Matrix4(); let n = 0;
+  for (let s = -1; s <= 1; s += 2)
+    for (let i = 0; i <= BAYS; i++) {
+      m.makeRotationY(i * 0.7);
+      m.setPosition(s * NAVE_W / 2, 0, Z0 + i * BAY);
+      columns.setMatrixAt(n++, m);
+    }
+}
+columns.instanceMatrix.needsUpdate = true;
+columns.layers.enable(REFLECT_LAYER);
+scene.add(columns);
+
+// ── arcade arches: springing from the capitals, along the nave ─────
+{
+  const g = archGeometry(ARCH_SPAN, 0.85, 1.30);
+  const arches = new THREE.InstancedMesh(g, matStone, BAYS * 2);
+  arches.castShadow = arches.receiveShadow = true;
+  const m = new THREE.Matrix4(); let n = 0;
+  for (let s = -1; s <= 1; s += 2)
+    for (let i = 0; i < BAYS; i++) {
+      m.makeRotationY(Math.PI / 2);
+      m.setPosition(s * NAVE_W / 2, SPRING, Z0 + (i + 0.5) * BAY);
+      arches.setMatrixAt(n++, m);
+    }
+  arches.instanceMatrix.needsUpdate = true;
+  arches.layers.enable(REFLECT_LAYER);
+  scene.add(arches);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   WALLS, FACADE, FLOOR
+   ═══════════════════════════════════════════════════════════════════ */
+function lancetPath(cx, base, spring, span, riseK = RISEK) {
+  const h = span / 2, rise = riseK * h;
+  const e = (rise * rise - h * h) / (2 * h), R = h + e;
+  const aL = Math.atan2(rise, -e), aR = Math.atan2(rise, e);
+  const p = new THREE.Path();
+  p.moveTo(cx - h, base);
+  p.lineTo(cx - h, spring);
+  p.absarc(cx + e, spring, R, Math.PI, aL, true);
+  p.absarc(cx - e, spring, R, aR, 0, true);
+  p.lineTo(cx + h, base);
+  p.closePath();
+  return p;
+}
+
+function slabGeo(x0, x1, y0, y1, holes, depth) {
+  const s = new THREE.Shape();
+  s.moveTo(x0, y0); s.lineTo(x1, y0); s.lineTo(x1, y1); s.lineTo(x0, y1); s.closePath();
+  s.holes = holes;
+  return new THREE.ExtrudeGeometry(s, {
+    depth, bevelEnabled: false, curveSegments: 20
+  });
+}
+
+let roseDisc;
+const glassOf = (map, bright) => new THREE.MeshBasicMaterial({
+  map, color: new THREE.Color().setScalar(bright),
+  toneMapped: true, fog: false, side: THREE.DoubleSide
+});
+
+/* ShapeGeometry hands back UVs in shape coordinates, which here span the
+   whole wall. Remap each window onto its own 0..1 so the glass texture
+   lands once per opening instead of once per bay run.               */
+function glassPane(cx, base, spring, span) {
+  const g = new THREE.ShapeGeometry(
+    new THREE.Shape(lancetPath(cx, base, spring, span).getPoints(30)));
+  g.computeBoundingBox();
+  const bb = g.boundingBox, uv = g.attributes.uv, p = g.attributes.position;
+  const w = bb.max.x - bb.min.x, h = bb.max.y - bb.min.y;
+  for (let i = 0; i < uv.count; i++)
+    uv.setXY(i, (p.getX(i) - bb.min.x) / w, (p.getY(i) - bb.min.y) / h);
+  return g;
+}
+
+// ── west facade, pierced by the rose ───────────────────────────────
+{
+  const hole = new THREE.Path();
+  hole.absarc(ROSE_C.x, ROSE_C.y, ROSE_R, 0, Math.PI * 2, true);
+  const g = slabGeo(-13, 13, 0, 25.5, [hole], 1.2);
+  const m = new THREE.Mesh(g, matStone);
+  m.position.z = Z0 - 1.2;
+  m.castShadow = m.receiveShadow = true;
+  m.layers.enable(REFLECT_LAYER);
+  scene.add(m);
+
+  // the window itself: not transmissive geometry, just the image you
+  // would actually see, bright enough to feed the bloom
+  roseDisc = new THREE.Mesh(
+    new THREE.CircleGeometry(ROSE_R, 96),
+    new THREE.MeshBasicMaterial({ map: roseTex, toneMapped: true, fog: false })
+  );
+  roseDisc.material.color.setScalar(2.2);
+  roseDisc.position.set(ROSE_C.x, ROSE_C.y, Z0 - 0.06);
+  roseDisc.layers.enable(REFLECT_LAYER);
+  scene.add(roseDisc);
+}
+
+// ── nave walls at x = ±7: arcade openings + clerestory ─────────────
+{
+  const holes = [];
+  for (let i = 0; i < BAYS; i++) {
+    const cz = Z0 + (i + 0.5) * BAY;
+    holes.push(lancetPath(cz, -1.0, SPRING, ARCH_SPAN));
+    holes.push(lancetPath(cz, 12.5, 13.5, 2.5));
+  }
+  const g = slabGeo(Z0 - 0.6, Z1 + 0.6, -1.0, WALL_TOP, holes, 0.9);
+  g.rotateY(-Math.PI / 2);
+  for (let s = -1; s <= 1; s += 2) {
+    const m = new THREE.Mesh(g, matStone);
+    m.position.x = s < 0 ? -NAVE_W / 2 : NAVE_W / 2 + 0.9;
+    m.castShadow = m.receiveShadow = true;
+    m.layers.enable(REFLECT_LAYER);
+    scene.add(m);
+  }
+  // clerestory glass, cool and dim — this is side fill, not the key
+  const cg = [];
+  for (let i = 0; i < BAYS; i++)
+    cg.push(glassPane(Z0 + (i + 0.5) * BAY, 12.5, 13.5, 2.5));
+  const cgeo = mergeGeometries(cg, false);
+  cgeo.rotateY(-Math.PI / 2);
+  for (let s = -1; s <= 1; s += 2) {
+    const m = new THREE.Mesh(cgeo, glassOf(clereGlassTex, 2.0));
+    m.position.x = s * (NAVE_W / 2 + 0.87);
+    m.layers.enable(REFLECT_LAYER);
+    scene.add(m);
+  }
+}
+
+// ── aisle outer walls with lancets, and the aisle ceiling ──────────
+const AISLE_X = NAVE_W / 2 + AISLE_W;
+{
+  const holes = [];
+  for (let i = 0; i < BAYS; i++)
+    holes.push(lancetPath(Z0 + (i + 0.5) * BAY, 5.6, 8.0, 2.8));
+  const g = slabGeo(Z0 - 0.6, Z1 + 0.6, -1.0, AISLE_TOP, holes, 1.0);
+  g.rotateY(-Math.PI / 2);
+  for (let s = -1; s <= 1; s += 2) {
+    const m = new THREE.Mesh(g, matStone);
+    m.position.x = s < 0 ? -AISLE_X : AISLE_X + 1.0;   // 1 m wall, inner face at ±AISLE_X
+    m.receiveShadow = true;
+    m.layers.enable(REFLECT_LAYER);
+    scene.add(m);
+  }
+  const gg = [];
+  for (let i = 0; i < BAYS; i++)
+    gg.push(glassPane(Z0 + (i + 0.5) * BAY, 5.6, 8.0, 2.8));
+  const ggeo = mergeGeometries(gg, false);
+  ggeo.rotateY(-Math.PI / 2);
+  for (let s = -1; s <= 1; s += 2) {
+    const m = new THREE.Mesh(ggeo, glassOf(aisleGlassTex, 1.75));
+    m.position.x = s * (AISLE_X - 0.03);
+    m.layers.enable(REFLECT_LAYER);
+    scene.add(m);
+  }
+  const ceil = new THREE.Mesh(
+    new THREE.PlaneGeometry(AISLE_W + 1, Z1 - Z0 + 1.2), matVault);
+  ceil.rotation.x = Math.PI / 2;
+  ceil.position.set(0, AISLE_TOP, (Z0 + Z1) / 2 - 0.3);
+  for (let s = -1; s <= 1; s += 2) {
+    const c = ceil.clone();
+    c.position.x = s * (NAVE_W / 2 + AISLE_W / 2 + 0.4);
+    scene.add(c);
+  }
+}
+
+// ── east end, closing the box behind the camera ────────────────────
+{
+  const m = new THREE.Mesh(slabGeo(-13.5, 13.5, -1, 22, [], 1.0), matStone);
+  m.position.z = Z1 + 0.6;
+  m.receiveShadow = true;
+  scene.add(m);
+}
+
+// ── floor, submerged ───────────────────────────────────────────────
+{
+  const W = 27, L = Z1 - Z0 + 3;
+  const g = new THREE.PlaneGeometry(W, L, 1, 1);
+  g.rotateX(-Math.PI / 2);
+  const uv = g.attributes.uv;                       // world-space tiling
+  for (let i = 0; i < uv.count; i++)
+    uv.setXY(i, uv.getX(i) * W / 2.4, uv.getY(i) * L / 2.4);
+  const m = new THREE.Mesh(g, matFloor);
+  m.position.set(0, 0, (Z0 + Z1) / 2 - 0.4);
+  m.receiveShadow = true;
+  scene.add(m);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   RIBBED VAULT — half-arches as cubic Béziers, webs as Coons patches
+   over the four boundary curves. The only non-trivial geometry here.
+   ═══════════════════════════════════════════════════════════════════ */
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+// leaves the springing vertically, arrives at the crown on a slope:
+// that slope is what makes it read Gothic rather than Roman
+function halfArch(spring, apex) {
+  const flat = V(spring.x - apex.x, 0, spring.z - apex.z);
+  const rise = apex.y - spring.y;
+  const c1 = spring.clone(); c1.y += rise * 0.60;
+  const c2 = apex.clone().addScaledVector(flat, 0.32);
+  return new THREE.CubicBezierCurve3(spring, c1, c2, apex);
+}
+
+/* Coons patch over a triangle: the v = 1 edge collapses onto the
+   keystone. eAB runs A→B, dA runs A→K, dB runs B→K.                */
+function coonsWeb(eAB, dA, dB, N, lift, hole) {
+  const K = dA.getPoint(1);
+  const A = eAB.getPoint(0), B = eAB.getPoint(1);
+  const pos = [], idx = [], uvs = [];
+  const tmp = new THREE.Vector3();
+  for (let j = 0; j <= N; j++) {
+    const v = j / N;
+    for (let i = 0; i <= N; i++) {
+      const u = i / N;
+      const E = eAB.getPoint(u), a = dA.getPoint(v), b = dB.getPoint(v);
+      tmp.set(0, 0, 0)
+        .addScaledVector(E, 1 - v).addScaledVector(K, v)
+        .addScaledVector(a, 1 - u).addScaledVector(b, u)
+        .addScaledVector(A, -(1 - u) * (1 - v))
+        .addScaledVector(B, -u * (1 - v))
+        .addScaledVector(K, -v);
+      pos.push(tmp.x, tmp.y + lift, tmp.z);
+      uvs.push(u, v);
+    }
+  }
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const a = j * (N + 1) + i, b = a + 1, c = a + N + 1, d = c + 1;
+    if (hole) {                              // drop the quads that fell in
+      const cx = (pos[a * 3] + pos[b * 3] + pos[c * 3] + pos[d * 3]) / 4;
+      const cz = (pos[a * 3 + 2] + pos[b * 3 + 2] + pos[c * 3 + 2] + pos[d * 3 + 2]) / 4;
+      if (hole(cx, cz)) continue;
+    }
+    idx.push(a, c, b, b, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+{
+  const H = NAVE_W / 2, ribs = [], webs = [];
+  const tube = c => new THREE.TubeGeometry(c, 14, 0.20, 6, false);
+
+  for (let i = 0; i < BAYS; i++) {
+    const z0 = Z0 + i * BAY, z1 = z0 + BAY, zc = (z0 + z1) / 2;
+    const K = V(0, VAULT_H, zc);                       // keystone
+    const A = V(-H, WALL_TOP, z0), B = V(H, WALL_TOP, z0);
+    const C = V(H, WALL_TOP, z1),  D = V(-H, WALL_TOP, z1);
+
+    const dA = halfArch(A, K), dB = halfArch(B, K);
+    const dC = halfArch(C, K), dD = halfArch(D, K);
+    ribs.push(tube(dA), tube(dB), tube(dC), tube(dD));
+
+    // transverse arches at the bay boundaries, longitudinal at the walls
+    const tN0 = halfArch(A, V(0, VAULT_H, z0)), tN1 = halfArch(B, V(0, VAULT_H, z0));
+    const tS0 = halfArch(D, V(0, VAULT_H, z1)), tS1 = halfArch(C, V(0, VAULT_H, z1));
+    const lW0 = halfArch(A, V(-H, VAULT_H, zc)), lW1 = halfArch(D, V(-H, VAULT_H, zc));
+    const lE0 = halfArch(B, V(H, VAULT_H, zc)),  lE1 = halfArch(C, V(H, VAULT_H, zc));
+    if (i === 0) ribs.push(tube(tN0), tube(tN1));
+    ribs.push(tube(tS0), tube(tS1), tube(lW0), tube(lW1), tube(lE0), tube(lE1));
+
+    // a full boundary arch, as one curve A→B, for the Coons edge
+    const joinArch = (h0, h1) => {
+      const cp = new THREE.CurvePath();
+      cp.add(h0);
+      cp.add(new THREE.CubicBezierCurve3(h1.v3, h1.v2, h1.v1, h1.v0));
+      return cp;
+    };
+
+    // the breached bay is tessellated finer so the torn edge reads
+    const hit = BREACH.z > z0 - 1 && BREACH.z < z1 + 1;
+    const n = hit ? 22 : 9, cut = hit ? inBreach : null;
+    webs.push(coonsWeb(joinArch(tN0, tN1), dA, dB, n, 0.16, cut));   // north
+    webs.push(coonsWeb(joinArch(tS0, tS1), dD, dC, n, 0.16, cut));   // south
+    webs.push(coonsWeb(joinArch(lW0, lW1), dA, dD, n, 0.16, cut));   // west
+    webs.push(coonsWeb(joinArch(lE0, lE1), dB, dC, n, 0.16, cut));   // east
+  }
+
+  // rubble left clinging to the rim
+  const rim = [];
+  for (let k = 0; k < 26; k++) {
+    const a = (k / 26) * Math.PI * 2;
+    const rr = breachRadius(Math.cos(a), Math.sin(a)) * (1.0 + (k % 3) * 0.045);
+    const g = new THREE.BoxGeometry(0.30 + (k % 4) * 0.11, 0.22 + (k % 3) * 0.09,
+                                    0.26 + (k % 5) * 0.07);
+    g.rotateY(a + (k % 7) * 0.21);
+    g.rotateX((k % 5 - 2) * 0.16);
+    g.translate(BREACH.x + Math.cos(a) * rr, VAULT_H - 0.50 - (k % 4) * 0.16,
+                BREACH.z + Math.sin(a) * rr);
+    rim.push(g);
+  }
+  const rimMesh = new THREE.Mesh(mergeGeometries(rim, false), matStone);
+  rimMesh.castShadow = rimMesh.receiveShadow = true;
+  scene.add(rimMesh);
+
+  /* An overcast sky, hung above the roof. Without it the hole reads as
+     a black patch rather than an opening — you need to see what the
+     light is coming from.                                          */
+  const skyDisc = new THREE.Mesh(
+    new THREE.CircleGeometry(16, 40),
+    new THREE.MeshBasicMaterial({ color: 0x9fb6d8, toneMapped: true, fog: false })
+  );
+  skyDisc.material.color.multiplyScalar(0.95);
+  skyDisc.rotation.x = Math.PI / 2;            // facing down into the nave
+  skyDisc.position.set(BREACH.x, 30, BREACH.z);
+  skyDisc.layers.enable(REFLECT_LAYER);
+  scene.add(skyDisc);
+
+  const ribMesh = new THREE.Mesh(mergeGeometries(ribs, false), matStone);
+  ribMesh.castShadow = ribMesh.receiveShadow = true;
+  scene.add(ribMesh);
+
+  const webMesh = new THREE.Mesh(mergeGeometries(webs, false), matVault);
+  webMesh.receiveShadow = true;
+  scene.add(webMesh);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   LIGHT — one key, projected through the rose. Everything else is fill.
+   ═══════════════════════════════════════════════════════════════════ */
+/* Intensity note: the brief's 2 000 000 cd is a real photometric value,
+   but bloom runs before tone mapping, so its 0.85 threshold only means
+   anything if scene radiance sits around 1.0. Rather than crush
+   exposure to ~0.006 and blow the whole bloom pass out, the same image
+   is reached by keeping exposure at 1.0 and putting the light in the
+   renderer's normalised range. Same picture, working bloom.          */
+const spot = new THREE.SpotLight(0xffffff, 26_000, 0, 0.42, 0.15, 2);
+spot.position.set(0, 17, -34);
+spot.target.position.set(0, 3, 10);
+spot.map = roseTex;
+spot.castShadow = true;
+spot.shadow.mapSize.set(2048, 2048);
+spot.shadow.bias = -0.0008;
+spot.shadow.normalBias = 0.02;
+spot.shadow.camera.near = 6;
+spot.shadow.camera.far = 78;
+scene.add(spot, spot.target);
+proj.uSpotMat.value = spot.shadow.matrix;
+// lights are layer-tested like any other object: without this the
+// mirror camera renders an unlit scene
+spot.layers.enable(REFLECT_LAYER);
+hemi.layers.enable(REFLECT_LAYER);
+
+/* Daylight through the breach. A narrow cone straight down, casting
+   shadows — the torn edge of the web is what shapes the beam, so the
+   shaft arrives with the same ragged outline as the hole itself.   */
+const sky = new THREE.SpotLight(0xd7e4ff, 11000, 0, 0.12, 0.35, 2);
+sky.position.set(BREACH.x, 46, BREACH.z);
+sky.target.position.set(BREACH.x, 0, BREACH.z);
+sky.castShadow = true;
+sky.shadow.mapSize.set(1024, 1024);
+sky.shadow.bias = -0.0009;
+sky.shadow.normalBias = 0.02;
+sky.shadow.camera.near = 18;
+sky.shadow.camera.far = 62;
+sky.layers.enable(REFLECT_LAYER);
+scene.add(sky, sky.target);
+
+// side fill through the aisle lancets: same trick, 20× weaker, no shadows
+const fillLights = [];
+for (let s = -1; s <= 1; s += 2) for (let k = 0; k < 2; k++) {
+  const z = Z0 + (k * 2 + 1.6) * BAY;
+  const f = new THREE.SpotLight(0xffffff, 620, 0, 0.72, 0.6, 2);
+  f.map = aisleGlassTex;                 // the side lights are projected too
+  f.position.set(s * (AISLE_X + 7), 9.5, z);
+  f.target.position.set(s * -1, 3.5, z + 3);
+  f.layers.enable(REFLECT_LAYER);
+  fillLights.push(f);
+  scene.add(f, f.target);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CAMERA — a fixed slow path, 90 s per loop, crossing the waterline
+   ═══════════════════════════════════════════════════════════════════ */
+const PATH = new THREE.CatmullRomCurve3([
+  V( 1.6, 5.05,  18.5),
+  V(-1.1, 4.20,  13.0),
+  V( 1.9, 3.62,   7.4),
+  V(-0.6, 4.20,   1.6),
+  V( 1.3, 5.15,  -4.2),
+  V(-1.7, 4.20,  -9.6),
+  V( 0.9, 3.70, -14.4),
+  V(-0.5, 4.55, -18.6)
+], false, 'catmullrom', 0.5);
+
+const LOOP_T = 90;
+let clock = new THREE.Clock();
+let paused = false, tPath = 0;
+const mouse = new THREE.Vector2(), mouseS = new THREE.Vector2();
+
+addEventListener('mousemove', e => {
+  mouse.set(e.clientX / innerWidth * 2 - 1, e.clientY / innerHeight * 2 - 1);
+});
+addEventListener('keydown', e => {
+  if (e.code === 'Space' && cfg.camera.mode !== 'free') paused = !paused;
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  onResize();
+});
+let onResize = () => {};
+
+/* ── moving around ─────────────────────────────────────────────────
+   Two ways to look: drag the mouse, or click for a pointer lock. Any
+   movement key drops you straight out of the scripted path, so you do
+   not have to know about the mode toggle to start walking.         */
+const keys = Object.create(null);
+const fly = { yaw: Math.PI, pitch: 0, speed: 6.0, locked: false, dragging: false };
+const _dir = new THREE.Vector3(), _right = new THREE.Vector3();
+const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
+const MOVE_KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE',
+                   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+
+// typing a value or arrowing through a dropdown in the panel must not
+// also drive the camera
+const inPanel = e => {
+  const t = e.target;
+  return !!t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' ||
+                 t.tagName === 'TEXTAREA' || t.isContentEditable === true);
+};
+
+addEventListener('keydown', e => {
+  if (inPanel(e)) return;
+  keys[e.code] = true;
+  if (e.code === 'KeyF') setMode(cfg.camera.mode === 'free' ? 'cinematic' : 'free');
+  else if (e.code === 'KeyP') togglePhoto();
+  else if (e.code === 'Enter') shoot();
+  else if (e.code === 'KeyH' && gui) gui.show(gui._hidden);
+  else if (MOVE_KEYS.includes(e.code) && cfg.camera.mode !== 'free') setMode('free');
+  if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+const cv = renderer.domElement;
+cv.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  if (cfg.camera.mode !== 'free') setMode('free');
+  fly.dragging = true;
+  cv.style.cursor = 'grabbing';
+});
+addEventListener('mouseup', () => { fly.dragging = false; cv.style.cursor = ''; });
+cv.addEventListener('dblclick', () => {
+  if (cfg.camera.mode === 'free') cv.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  fly.locked = document.pointerLockElement === cv;
+});
+cv.addEventListener('wheel', e => {
+  if (cfg.camera.mode !== 'free') return;
+  fly.speed = THREE.MathUtils.clamp(fly.speed * (e.deltaY > 0 ? 0.86 : 1.16), 0.5, 40);
+  guiRefresh();
+  e.preventDefault();
+}, { passive: false });
+
+addEventListener('mousemove', e => {
+  if (cfg.camera.mode !== 'free' || !(fly.locked || fly.dragging)) return;
+  fly.yaw   -= e.movementX * 0.0024;
+  fly.pitch  = THREE.MathUtils.clamp(fly.pitch - e.movementY * 0.0024, -1.5, 1.5);
+});
+
+const HUD_FREE = 'wasd — move · q/e — up/down · shift — faster · wheel — speed · '
+               + 'drag or double-click — look · f — cinematic · h — panel';
+const HUD_CINE = 'click for sound · space — pause · mouse — look · wasd or f — walk in · h — panel';
+
+function setMode(m) {
+  cfg.camera.mode = m;
+  if (m === 'free') {
+    _euler.setFromQuaternion(camera.quaternion);
+    fly.yaw = _euler.y; fly.pitch = _euler.x;
+    hud.textContent = HUD_FREE;
+    cv.style.cursor = 'grab';
+  } else {
+    document.exitPointerLock?.();
+    hud.textContent = HUD_CINE;
+    cv.style.cursor = '';
+  }
+  guiRefresh();
+  saveSoon();
+}
+
+// keep the camera inside the building — outside it there is only black
+function clampToScene(p) {
+  const m = 0.6;
+  p.x = THREE.MathUtils.clamp(p.x, -AISLE_X + m, AISLE_X - m);
+  p.z = THREE.MathUtils.clamp(p.z, Z0 + m, Z1 - m);
+  p.y = THREE.MathUtils.clamp(p.y, 0.5, VAULT_H - 1.2);
+}
+
+const lookTmp = new THREE.Vector3(), posTmp = new THREE.Vector3();
+function driveCamera(dt) {
+  if (cfg.camera.mode === 'free') {
+    camera.quaternion.setFromEuler(_euler.set(fly.pitch, fly.yaw, 0));
+    const v = fly.speed * (keys.ShiftLeft || keys.ShiftRight ? 3.5 : 1) * dt;
+    camera.getWorldDirection(_dir);
+    if (cfg.camera.walk) _dir.y = 0;                 // stay level when walking
+    _dir.normalize();
+    _right.crossVectors(_dir, camera.up).normalize();
+    if (keys.KeyW || keys.ArrowUp)    camera.position.addScaledVector(_dir, v);
+    if (keys.KeyS || keys.ArrowDown)  camera.position.addScaledVector(_dir, -v);
+    if (keys.KeyD || keys.ArrowRight) camera.position.addScaledVector(_right, v);
+    if (keys.KeyA || keys.ArrowLeft)  camera.position.addScaledVector(_right, -v);
+    if (keys.KeyE || keys.Space)      camera.position.y += v;
+    if (keys.KeyQ || keys.ControlLeft) camera.position.y -= v;
+    if (cfg.camera.walk)
+      camera.position.y += (cfg.camera.eye - camera.position.y) * Math.min(1, dt * 6);
+    if (cfg.camera.bounds) clampToScene(camera.position);
+    return;
+  }
+
+  if (!paused) tPath = (tPath + dt / (LOOP_T / cfg.camera.speed)) % 1;
+  const u = tPath;
+  PATH.getPointAt(u, posTmp);
+  camera.position.copy(posTmp);
+
+  // always toward the rose, with a slow drift, then ±15° of mouse
+  const drift = Math.sin(u * Math.PI * 2 * 2.0) * 0.14;
+  lookTmp.set(ROSE_C.x + drift * 9, ROSE_C.y - 5.5 + Math.sin(u * 12.6) * 1.2, ROSE_C.z + 2);
+  camera.lookAt(lookTmp);
+  mouseS.lerp(mouse, 0.045);
+  const lim = THREE.MathUtils.degToRad(cfg.camera.look);
+  camera.rotateY(-mouseS.x * lim);
+  camera.rotateX(-mouseS.y * lim * 0.72);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   WATER — Gerstner displacement, planar reflection, analytic refraction
+   ═══════════════════════════════════════════════════════════════════ */
+let REFL_SCALE = 0.5;                        // half res: ripples hide it
+const reflRT = new THREE.WebGLRenderTarget(1, 1, {
+  type: THREE.HalfFloatType, minFilter: THREE.LinearFilter,
+  magFilter: THREE.LinearFilter, depthBuffer: true
+});
+const reflCam = new THREE.PerspectiveCamera();
+reflCam.layers.set(REFLECT_LAYER);
+const reflMatrix = new THREE.Matrix4();
+const clipAbove = new THREE.Plane(new THREE.Vector3(0, 1, 0), -WATER_Y);
+
+const waterUniforms = {
+  uTime,
+  uRefl:       { value: reflRT.texture },
+  uReflMat:    { value: reflMatrix },
+  uCaustics:   { value: causticsTex },
+  uRipple:     { value: stoneNormal },
+  uFloor:      { value: floorTex },
+  uSpotMat:    proj.uSpotMat,
+  uSpotMap:    { value: roseTex },
+  uSpotShadow: proj.uSpotShadow,
+  uCam:        { value: new THREE.Vector3() },
+  uWaterY:     { value: WATER_Y },
+  uDeep:       { value: new THREE.Color(0x0a2836) },
+  uUnder:      { value: 0 },
+  uCaustic:    proj.uCaustic,
+  uWave:       { value: new THREE.Vector4(1.0, 1.0, 1.0, 0.16) }, // amp, steep, speed, detail
+  uAbsorb:     { value: 0.040 },
+  // ring buffer of drip impacts: xz = where, z = when, w = strength
+  uRipples:    { value: Array.from({ length: 12 }, () => new THREE.Vector4(0, 0, -99, 0)) },
+  // rgb = the scene behind the water, a = its linear depth over far
+  uRefract:    { value: null },
+  uRes:        { value: new THREE.Vector2(1, 1) },
+  uFar:        { value: 220 },
+  uRefr:       { value: 0.055 }
+};
+
+const waterMat = new THREE.ShaderMaterial({
+  uniforms: waterUniforms,
+  side: THREE.DoubleSide,
+  vertexShader: /* glsl */`
+    uniform float uTime, uWaterY;
+    uniform mat4  uReflMat;
+    uniform vec4  uWave;
+    uniform vec3  uCam;
+    uniform vec4  uRipples[12];
+    varying vec3 vW;
+    varying vec3 vN;
+    varying vec4 vReflUV;
+    varying float vViewZ;
+
+    const float G = 9.81;
+    // dir.xy, wavelength, amplitude — descending, total steepness ≤ 0.10
+    ${WAVE_GLSL}
+
+    void gerstner(vec4 w, vec2 p, float t, inout vec3 disp, inout vec3 nrm) {
+      vec2  d = normalize(w.xy);
+      float k = 6.2831853 / w.z;
+      float a = w.w * uWave.x;
+      float om = sqrt(G * k);
+      float q  = min(1.0, (0.10 * uWave.y) / (4.0 * k * max(a, 1e-5)));
+      float ph = k * dot(d, p) - om * t;
+      float c = cos(ph), s = sin(ph);
+      disp += vec3(q * a * d.x * c, a * s, q * a * d.y * c);
+      float wa = k * a;
+      nrm += vec3(-d.x * wa * c, -q * wa * s, -d.y * wa * c);
+    }
+
+    void main() {
+      vec3 p = position;                       // plane already lies in XZ
+      vec3 disp = vec3(0.0), acc = vec3(0.0);
+      vec3 wp0 = (modelMatrix * vec4(p, 1.0)).xyz;
+      float t = uTime * uWave.z;
+      gerstner(W0, wp0.xz, t, disp, acc);
+      gerstner(W1, wp0.xz, t, disp, acc);
+      gerstner(W2, wp0.xz, t, disp, acc);
+      gerstner(W3, wp0.xz, t, disp, acc);
+      // When the eye sits on the waterline, a crest 2 cm high swamps the
+      // frame and smears the grazing reflection across it. Flatten the
+      // surface in a small disc around the camera — only while it is in
+      // that band, and only where no detail could be resolved anyway.
+      float near = smoothstep(0.0, 3.5, length(wp0.xz - uCam.xz));
+      float band = 1.0 - smoothstep(0.35, 0.90, abs(uCam.y - uWaterY));
+      float taper = mix(1.0, near, band);
+      disp *= taper;
+      acc  *= taper;
+
+      // drip impacts: an outgoing ring, decaying in age and in radius
+      for (int i = 0; i < 12; i++) {
+        vec4 rp = uRipples[i];
+        float age = uTime - rp.z;
+        if (age < 0.0 || age > 3.4 || rp.w <= 0.0) continue;
+        vec2  d2 = wp0.xz - rp.xy;
+        float d  = length(d2);
+        float front = age * 1.35;                    // ring radius
+        float env = exp(-abs(d - front) * 3.6) * exp(-age * 1.05) * exp(-d * 0.30);
+        float phase = (d - front) * 13.0;
+        disp.y += rp.w * 0.048 * env * cos(phase);
+        vec2 g = (d > 1e-4 ? d2 / d : vec2(0.0)) * rp.w * 0.62 * env * sin(phase);
+        acc.x -= g.x;
+        acc.z -= g.y;
+      }
+
+      vec3 wp = wp0 + disp;
+      vN = normalize(vec3(acc.x, 1.0 + acc.y, acc.z));
+      vW = wp;
+      vReflUV = uReflMat * vec4(wp, 1.0);
+      vec4 mv = viewMatrix * vec4(wp, 1.0);
+      vViewZ = -mv.z;
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D uRefl, uCaustics, uRipple, uFloor, uSpotMap, uSpotShadow, uRefract;
+    uniform mat4  uSpotMat;
+    uniform vec3  uCam, uDeep, uCaustic;
+    uniform vec4  uWave;
+    uniform vec2  uRes;
+    uniform float uTime, uWaterY, uUnder, uAbsorb, uFar, uRefr;
+    varying vec3 vW;
+    varying vec3 vN;
+    varying vec4 vReflUV;
+    varying float vViewZ;
+
+    #include <packing>
+
+    vec3 roseAtW(vec3 wp) {
+      vec4 sp = uSpotMat * vec4(wp, 1.0);
+      if (sp.w <= 0.0) return vec3(0.0);
+      vec3 c = sp.xyz / sp.w;
+      if (any(lessThan(c.xy, vec2(0.001))) || any(greaterThan(c.xy, vec2(0.999)))) return vec3(0.0);
+      float sd = unpackRGBAToDepth(texture2D(uSpotShadow, c.xy));
+      float vis = step(c.z - 0.004, sd);
+      return texture2D(uSpotMap, c.xy).rgb * vis;
+    }
+    float caustic(vec2 xz) {
+      float t = uTime * uCaustic.z;
+      vec2 s = xz * uCaustic.y;
+      float c = texture2D(uCaustics, s * 0.25 + t * vec2( 0.014, 0.009)).r
+              * texture2D(uCaustics, s * 0.41 - t * vec2( 0.011, 0.017)).r;
+      return pow(c, 0.75) * uCaustic.x;
+    }
+
+    void main() {
+      vec3 V = normalize(uCam - vW);
+      vec3 N = normalize(vN);
+
+      // two scrolling fine-scale layers, highlights only
+      vec3 d1 = texture2D(uRipple, vW.xz * 0.22 + uTime * vec2(0.020, 0.013)).xyz * 2.0 - 1.0;
+      vec3 d2 = texture2D(uRipple, vW.xz * 0.55 - uTime * vec2(0.016, 0.024)).xyz * 2.0 - 1.0;
+      N = normalize(N + vec3(d1.x + d2.x, 0.0, d1.y + d2.y) * uWave.w);
+      if (uUnder > 0.5) N = -N;
+
+      float F = 0.02 + 0.98 * pow(1.0 - max(dot(V, N), 0.0), 5.0);
+
+      // reflection, offset along the surface normal
+      vec2 ruv = vReflUV.xy / max(vReflUV.w, 1e-4) + N.xz * 0.055;
+      vec3 reflectColor = texture2D(uRefl, clamp(ruv, 0.001, 0.999)).rgb
+                        + vec3(0.010, 0.014, 0.021);
+
+      /* Refraction is screen space now: the scene was rendered once
+         without the water and handed here as colour plus linear depth.
+         So anything submerged — floor, column bases, the caustics
+         already baked onto them — shows through properly, and the
+         distance the light travelled through water falls out of the
+         depth difference instead of a plane intersection.          */
+      vec2 suv = gl_FragCoord.xy / uRes;
+      vec2 off = N.xz * uRefr / (1.0 + vViewZ * 0.05);
+      vec2 ruv2 = clamp(suv + off, vec2(0.002), vec2(0.998));
+      vec4 back = texture2D(uRefract, ruv2);
+      // a sample nearer than the surface is geometry in front of the
+      // water bleeding in — fall back to the undistorted pixel
+      if (back.a * uFar < vViewZ) { ruv2 = suv; back = texture2D(uRefract, suv); }
+      float travel = max(0.0, back.a * uFar - vViewZ) * 1.12;
+      vec3 refractColor = mix(back.rgb * 1.85, uDeep * 0.6, 1.0 - exp(-travel * uAbsorb));
+
+      vec3 col;
+      if (uUnder > 0.5) {
+        /* From underneath, the surface is not a mirror and not a window
+           — it is both, split at the critical angle. Everything above
+           the water arrives through a cone about 48.7° wide; outside it
+           the surface reflects the flooded nave back at you.        */
+        float up = clamp(-V.y, 0.0, 1.0);
+        float window = smoothstep(0.56, 0.74, up);
+        // through the window you see the real thing, not a mirror of it
+        vec3 above = back.rgb * 1.15 + vec3(0.016, 0.022, 0.030);
+        vec3 tir = uDeep * 1.20
+                 + caustic(vW.xz) * roseAtW(vW) * uDeep * 2.2
+                 + reflectColor * 0.09;
+        col = mix(tir, above, window);
+      } else {
+        col = mix(refractColor, reflectColor, F);
+      }
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `
+});
+
+const waterGeo = new THREE.PlaneGeometry(28, (Z1 - Z0) + 6, 400, 400);
+waterGeo.rotateX(-Math.PI / 2);
+const water = new THREE.Mesh(waterGeo, waterMat);
+water.position.set(0, WATER_Y, (Z0 + Z1) / 2 - 1);
+water.frustumCulled = false;
+water.layers.set(WATER_LAYER);      // excluded from the main pass on purpose
+scene.add(water);
+
+function sizeReflect() {
+  reflRT.setSize(Math.max(2, Math.floor(innerWidth * REFL_SCALE)),
+                 Math.max(2, Math.floor(innerHeight * REFL_SCALE)));
+}
+sizeReflect();
+
+const _fwd = new THREE.Vector3(), _tgt = new THREE.Vector3(), _up = new THREE.Vector3();
+function renderReflection() {
+  const h = water.position.y;
+  reflCam.copy(camera, false);
+  reflCam.layers.set(REFLECT_LAYER);
+  reflCam.position.set(camera.position.x, 2 * h - camera.position.y, camera.position.z);
+  camera.getWorldDirection(_fwd);
+  _tgt.copy(camera.position).add(_fwd);
+  _tgt.y = 2 * h - _tgt.y;
+  _up.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  _up.y = -_up.y;
+  reflCam.up.copy(_up);
+  reflCam.lookAt(_tgt);
+  reflCam.projectionMatrix.copy(camera.projectionMatrix);
+  reflCam.updateMatrixWorld(true);
+  reflCam.matrixWorldInverse.copy(reflCam.matrixWorld).invert();
+
+  reflMatrix.set(0.5, 0, 0, 0.5,  0, 0.5, 0, 0.5,  0, 0, 0.5, 0.5,  0, 0, 0, 1);
+  reflMatrix.multiply(reflCam.projectionMatrix);
+  reflMatrix.multiply(reflCam.matrixWorldInverse);
+
+  water.visible = false;
+  renderer.clippingPlanes = [clipAbove];
+  const prevTarget = renderer.getRenderTarget();
+  renderer.setRenderTarget(reflRT);
+  renderer.clear();
+  renderer.render(scene, reflCam);
+  renderer.setRenderTarget(prevTarget);
+  renderer.clippingPlanes = [];
+  water.visible = true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SOUND — synthesised, like everything else here. Noise shaped into
+   water, a plink per real drip impact, and a convolution reverb whose
+   impulse response is generated rather than recorded: sparse early
+   reflections off the arcade, then a long stone tail.
+   Browsers will not start audio without a gesture, so the graph is
+   built on the first click or key.
+   ═══════════════════════════════════════════════════════════════════ */
+const audio = (() => {
+  let ctx = null, master, dryG, wetG, lp, waterG, dripBus, lfoGain, noiseBuf;
+  let ready = false, nextLap = 0;
+
+  function noiseBuffer(sec) {
+    const n = ctx.sampleRate * sec, b = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = b.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < n; i++) {                 // pink-ish: one-pole on white
+      const w = Math.random() * 2 - 1;
+      last = (last * 0.86 + w * 0.14);
+      d[i] = last * 3.2;
+    }
+    return b;
+  }
+
+  // a nave is long, hard and mostly empty: late reverb of several seconds
+  function impulse(sec, decay) {
+    const n = Math.floor(ctx.sampleRate * sec);
+    const b = ctx.createBuffer(2, n, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = b.getChannelData(ch);
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay) * (t < 0.004 ? 0.3 : 1);
+      }
+      for (let k = 0; k < 20; k++) {              // discrete slaps off the arcade
+        const p = Math.floor(ctx.sampleRate * (0.011 + k * 0.0075 + Math.random() * 0.02));
+        if (p < n) d[p] += (Math.random() * 2 - 1) * 0.5 * Math.pow(1 - k / 20, 1.5);
+      }
+    }
+    return b;
+  }
+
+  function build() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    master = ctx.createGain();  master.gain.value = 0;
+    lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 18000;
+    master.connect(lp); lp.connect(ctx.destination);
+
+    const conv = ctx.createConvolver();
+    conv.buffer = impulse(4.6, 2.6);
+    dryG = ctx.createGain(); dryG.gain.value = 0.62;
+    wetG = ctx.createGain(); wetG.gain.value = 0.85;
+    conv.connect(wetG);
+    dryG.connect(master); wetG.connect(master);
+
+    const bus = ctx.createGain();
+    bus.connect(dryG); bus.connect(conv);
+    dripBus = bus;
+
+    /* Water indoors is not surf. A broad noise band reads as a beach,
+       so the bed is narrow, low and almost inaudible — the audible part
+       is sparse laps against the stone, scheduled rather than sustained,
+       and it is mostly the reverb tail you actually hear.            */
+    noiseBuf = noiseBuffer(4);
+    const src = ctx.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+    bp.frequency.value = 190; bp.Q.value = 1.7;
+    const low = ctx.createBiquadFilter(); low.type = 'lowpass'; low.frequency.value = 110;
+    waterG = ctx.createGain(); waterG.gain.value = 0.04;
+    const lowG = ctx.createGain(); lowG.gain.value = 0.18;
+    src.connect(bp); bp.connect(waterG);
+    src.connect(low); low.connect(lowG); lowG.connect(waterG);
+    waterG.connect(dryG); waterG.connect(conv);
+
+    // the bed wanders instead of sitting on one note
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 0.061;
+    const lfo2 = ctx.createOscillator(); lfo2.frequency.value = 0.029;
+    lfoGain = ctx.createGain(); lfoGain.gain.value = 42;
+    lfo.connect(lfoGain); lfo2.connect(lfoGain);
+    lfoGain.connect(bp.frequency);
+    lfo.start(); lfo2.start(); src.start();
+
+    ready = true;
+  }
+
+  // one soft lap of water against stone
+  function lap(t) {
+    const s = ctx.createBufferSource(); s.buffer = noiseBuf;
+    s.loop = true;
+    s.playbackRate.value = 0.5 + Math.random() * 0.4;
+    const f = ctx.createBiquadFilter(); f.type = 'bandpass';
+    f.frequency.value = 240 + Math.random() * 260; f.Q.value = 1.1;
+    const g = ctx.createGain();
+    const v = 0.035 * cfg.audio.water / 0.04;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(v, t + 0.09 + Math.random() * 0.08);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55 + Math.random() * 0.5);
+    const p = ctx.createStereoPanner();
+    p.pan.value = Math.random() * 1.5 - 0.75;
+    s.connect(f); f.connect(g); g.connect(p); p.connect(dripBus);
+    s.start(t); s.stop(t + 1.3);
+  }
+
+  function unlock() {
+    build();
+    if (ctx && ctx.state === 'suspended') ctx.resume();
+  }
+
+  return {
+    unlock,
+    get on() { return ready; },
+    /* A drop is not a falling pitch — that is a laser. What you hear is
+       the bubble left behind by the impact, and as it shrinks its
+       resonance goes UP. So: a very short broadband tick for the strike,
+       then a short sine rising by a few semitones and dying fast.    */
+    drip(x, z, amp) {
+      if (!ready || !cfg.audio.on) return;
+      const t = ctx.currentTime;
+      const dx = x - camera.position.x, dz = z - camera.position.z;
+      const dist = Math.hypot(dx, dz);
+      const v = amp * cfg.audio.drips * 0.42 / (1 + dist * 0.22);
+      if (v < 0.0005) return;
+
+      const p = ctx.createStereoPanner();
+      const right = new THREE.Vector3();
+      camera.getWorldDirection(right);
+      right.cross(camera.up).normalize();
+      p.pan.value = THREE.MathUtils.clamp((dx * right.x + dz * right.z) / (dist + 0.6), -0.9, 0.9);
+      p.connect(dripBus);
+
+      const rnd = Math.abs(Math.sin(x * 12.9898 + z * 78.233) * 43758.5453) % 1;
+      const f0 = 620 + rnd * 1500;
+
+      const o = ctx.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(f0, t);
+      o.frequency.exponentialRampToValueAtTime(f0 * (1.13 + rnd * 0.16), t + 0.045);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(v, t + 0.003);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.10 + rnd * 0.06);
+      o.connect(g); g.connect(p);
+      o.start(t); o.stop(t + 0.20);
+
+      const n = ctx.createBufferSource(); n.buffer = noiseBuf;
+      n.playbackRate.value = 1.6;
+      const nf = ctx.createBiquadFilter(); nf.type = 'highpass'; nf.frequency.value = 1800;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(v * 0.5, t);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.018);
+      n.connect(nf); nf.connect(ng); ng.connect(p);
+      n.start(t); n.stop(t + 0.05);
+    },
+    update(under) {
+      if (!ready) return;
+      const a = cfg.audio;
+      const t = ctx.currentTime;
+      master.gain.setTargetAtTime(a.on ? a.master : 0, t, 0.15);
+      waterG.gain.setTargetAtTime(a.water * (under > 0.5 ? 1.9 : 1.0), t, 0.25);
+      if (a.on && a.water > 0.001 && under < 0.5 && t > nextLap) {
+        if (nextLap > 0) lap(t + 0.02);
+        nextLap = t + 1.8 + Math.random() * 4.2;
+      }
+      wetG.gain.setTargetAtTime(a.reverb, t, 0.2);
+      // under the surface everything above it goes muffled
+      lp.frequency.setTargetAtTime(under > 0.5 ? 420 : 18000, t, 0.18);
+    }
+  };
+})();
+addEventListener('pointerdown', () => audio.unlock(), { once: true });
+addEventListener('keydown', () => audio.unlock(), { once: true });
+
+/* ═══════════════════════════════════════════════════════════════════
+   WHAT IS STILL LIVING IN HERE — drowned oak, votive candles, and the
+   slow drip off the vault. All of it floats on the same wave field the
+   water shader solves, so nothing skates over the surface.
+   ═══════════════════════════════════════════════════════════════════ */
+function makeWoodTexture(S = 512) {
+  const cv = makeCanvas(S), g = cv.getContext('2d');
+  const img = g.createImageData(S, S), d = img.data;
+  const hash = (x, y, s) => {
+    let h = (x * 2654435761 + y * 340573321 + s * 1103515245) | 0;
+    h = (h ^ (h >> 14)) * 2246822519 | 0;
+    return ((h ^ (h >> 13)) >>> 0) / 4294967296;
+  };
+  const sm = t => t * t * (3 - 2 * t);
+  const vn = (u, v, nx, ny, s) => {
+    const fx = u * nx, fy = v * ny;
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = sm(fx - x0), ty = sm(fy - y0);
+    const w = (a, b) => hash(((a % nx) + nx) % nx, ((b % ny) + ny) % ny, s);
+    return (w(x0, y0) * (1 - tx) + w(x0 + 1, y0) * tx) * (1 - ty)
+         + (w(x0, y0 + 1) * (1 - tx) + w(x0 + 1, y0 + 1) * tx) * ty;
+  };
+  // grain runs along v; rings are bands across u, wobbled by the grain
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S;
+    const grain = vn(u, v, 6, 2, 5) * 0.6 + vn(u, v, 22, 3, 9) * 0.3 + vn(u, v, 90, 12, 13) * 0.1;
+    const rings = Math.sin(Math.PI * 2 * (u * 9 + grain * 2.1)) * 0.5 + 0.5;
+    const fibre = vn(u, v, 160, 5, 17);
+    let t = rings * 0.62 + fibre * 0.22 + grain * 0.16;
+    const plank = Math.floor(v * 4);                       // four boards
+    t *= 0.86 + hash(plank, 3, 31) * 0.28;
+    const seam = Math.abs((v * 4) % 1 - 0.5) > 0.482 ? 0.42 : 1.0;
+    const i = (y * S + x) * 4;
+    d[i]     = (74 + t * 128) * seam;
+    d[i + 1] = (49 + t * 90) * seam;
+    d[i + 2] = (31 + t * 55) * seam;
+    d[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  return tex;
+}
+
+function radialSprite(S, stops) {
+  const cv = makeCanvas(S), g = cv.getContext('2d');
+  const grd = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  stops.forEach(([o, c]) => grd.addColorStop(o, c));
+  g.fillStyle = grd; g.fillRect(0, 0, S, S);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const woodTex = makeWoodTexture();
+const matWood = injectStone(new THREE.MeshStandardMaterial({
+  map: woodTex, color: 0xffffff, roughness: 0.74, metalness: 0.0,
+  normalMap: marble.normal, normalScale: new THREE.Vector2(0.25, 0.25)
+}), { caustics: false });
+
+/* ── pews: drowned oak, still floating ─────────────────────────────*/
+function pewGeometry() {
+  const parts = [];
+  const add = (w, h, d, x, y, z, rx = 0) => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    if (rx) g.rotateX(rx);
+    g.translate(x, y, z);
+    parts.push(g);
+  };
+  add(2.70, 0.075, 0.44,  0, 0.00,  0.00);            // seat
+  add(2.70, 0.46,  0.065, 0, 0.30, -0.20, -0.16);     // back
+  add(2.70, 0.10,  0.10,  0, -0.16, 0.16);            // rail
+  add(0.085, 0.62, 0.46, -1.31, -0.02, 0);            // ends
+  add(0.085, 0.62, 0.46,  1.31, -0.02, 0);
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+const PEWS = 9;
+const pews = new THREE.InstancedMesh(pewGeometry(), matWood, PEWS);
+pews.castShadow = pews.receiveShadow = true;
+pews.frustumCulled = false;
+pews.layers.enable(REFLECT_LAYER);
+scene.add(pews);
+const pewState = Array.from({ length: PEWS }, (_, i) => ({
+  x: -6.4 + ((i * 4.7) % 12.4) + (i % 3) * 0.6,
+  z: Z0 + 5 + ((i * 6.3) % (Z1 - Z0 - 9)),
+  rot: (i * 1.37) % (Math.PI * 2),
+  spin: ((i % 5) - 2) * 0.004,
+  lift: 0.30 + (i % 4) * 0.035          // riding high, the way waterlogged oak does
+}));
+
+/* ── candles: floating votives, the only warm light in the building ─*/
+const CANDLES = 64;
+const candleGeo = new THREE.CylinderGeometry(0.042, 0.046, 0.15, 8, 1);
+candleGeo.translate(0, 0.075, 0);
+// wax is translucent: a real votive glows from the inside, so the body
+// gets its own emission rather than relying on the flame to light it
+const matWax = new THREE.MeshStandardMaterial({
+  color: 0xefe4c6, roughness: 0.5, emissive: 0xff9a45, emissiveIntensity: 0.30
+});
+const candles = new THREE.InstancedMesh(candleGeo, matWax, CANDLES);
+candles.frustumCulled = false;
+candles.castShadow = false;
+candles.layers.enable(REFLECT_LAYER);
+scene.add(candles);
+
+const flameTex = radialSprite(64, [
+  [0.00, 'rgba(255,252,236,1)'], [0.22, 'rgba(255,214,132,0.95)'],
+  [0.50, 'rgba(255,146,44,0.42)'], [1.00, 'rgba(255,110,20,0)']
+]);
+const flamePos = new Float32Array(CANDLES * 3);
+const flameGeo = new THREE.BufferGeometry();
+flameGeo.setAttribute('position', new THREE.BufferAttribute(flamePos, 3));
+const flames = new THREE.Points(flameGeo, new THREE.PointsMaterial({
+  size: 0.20, map: flameTex, transparent: true, depthWrite: false,
+  blending: THREE.AdditiveBlending, sizeAttenuation: true, fog: false
+}));
+flames.material.color.setScalar(6.0);           // sits above the bloom threshold
+flames.frustumCulled = false;
+flames.layers.enable(REFLECT_LAYER);
+scene.add(flames);
+
+const candleState = Array.from({ length: CANDLES }, (_, i) => {
+  const a = i * 2.3999;                          // golden angle, no clumping
+  const r = 1.4 + Math.sqrt(i / CANDLES) * 9.4;
+  return {
+    x: THREE.MathUtils.clamp(Math.cos(a) * r * 0.62, -11.4, 11.4),
+    z: THREE.MathUtils.clamp(Math.sin(a) * r * 1.9 + (Z0 + Z1) / 2 - 2, Z0 + 2.5, Z1 - 2.5),
+    ph: i * 1.7, flick: 0
+  };
+});
+// a handful of real lights; the rest is emissive sprite and bloom
+const candleLights = [0, 17, 38, 55].map(i => {
+  const L = new THREE.PointLight(0xffb562, 2.2, 9, 2);
+  L.layers.enable(REFLECT_LAYER);
+  scene.add(L);
+  return { light: L, idx: i };
+});
+
+/* ── drips off the vault ───────────────────────────────────────────*/
+const DRIPS = 22;
+const dripPos = new Float32Array(DRIPS * 3);
+const dripGeo = new THREE.BufferGeometry();
+dripGeo.setAttribute('position', new THREE.BufferAttribute(dripPos, 3));
+const drips = new THREE.Points(dripGeo, new THREE.PointsMaterial({
+  size: 0.085, map: radialSprite(32, [
+    [0.0, 'rgba(230,242,255,1)'], [0.45, 'rgba(180,210,235,0.55)'], [1.0, 'rgba(150,190,220,0)']
+  ]),
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  sizeAttenuation: true, fog: false
+}));
+drips.material.color.setScalar(1.7);
+drips.frustumCulled = false;
+scene.add(drips);
+
+const dripState = Array.from({ length: DRIPS }, (_, i) => ({
+  x: -6.2 + ((i * 3.1) % 12.4),
+  z: Z0 + 3 + ((i * 5.7) % (Z1 - Z0 - 6)),
+  y: 0, v: 0, wait: (i * 0.83) % 6
+}));
+/* ── bats ──────────────────────────────────────────────────────────
+   They live where the light is: wheeling under the vault, crossing the
+   shafts. The flap is a squash along the wingspan rather than real
+   articulation — at twelve metres that is all the eye reads, and it
+   costs one instance matrix.                                       */
+const BAT_SIZE = 1.9;
+function batGeometry() {
+  const k = BAT_SIZE;
+  const wing = (side) => {
+    const g = new THREE.BufferGeometry();
+    const s = side * k;
+    g.setAttribute('position', new THREE.Float32BufferAttribute([
+      0, 0, -0.05 * k,  s * 0.62, 0.02 * k, -0.16 * k,  s * 0.30, 0.0, 0.14 * k,
+      0, 0, -0.05 * k,  s * 0.30, 0.0, 0.14 * k,        s * 0.10, -0.01 * k, 0.10 * k
+    ], 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(
+      [0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0.5, 1], 2));
+    g.computeVertexNormals();
+    return g;
+  };
+  // the capsule is indexed and the wings are not — merge needs one or the other
+  const body = new THREE.CapsuleGeometry(0.045 * k, 0.10 * k, 3, 6).toNonIndexed();
+  body.rotateX(Math.PI / 2);
+  const g = mergeGeometries([body, wing(1), wing(-1)], false);
+  g.computeVertexNormals();
+  return g;
+}
+const BATS = 9;
+const matBat = new THREE.MeshStandardMaterial({
+  color: 0x3d3129, roughness: 0.62, metalness: 0, side: THREE.DoubleSide
+});
+const bats = new THREE.InstancedMesh(batGeometry(), matBat, BATS);
+bats.frustumCulled = false;
+bats.castShadow = false;
+bats.layers.enable(REFLECT_LAYER);      // low enough now that they reflect
+scene.add(bats);
+const batState = Array.from({ length: BATS }, (_, i) => ({
+  cx: -3 + ((i * 3.7) % 7),
+  cz: Z0 + 6 + ((i * 7.3) % (Z1 - Z0 - 12)),
+  ra: 3.6 + (i % 4) * 1.6,          // orbit radius
+  rb: 2.4 + (i % 3) * 1.2,
+  y:  7.4 + (i % 5) * 1.25,         // down in the nave, crossing the shafts
+  bob: 1.5 + (i % 3) * 0.7,         // some dip low enough to skim the water
+  sp: 0.42 + (i % 5) * 0.075,       // angular speed
+  ph: i * 1.9,
+  flap: 9.5 + (i % 4) * 1.6
+}));
+
+/* ── rain through the breach ───────────────────────────────────────
+   Streaks, not dots: a vertical sprite reads as falling water where a
+   round point reads as snow. They only exist inside the hole's cone,
+   so the shaft and the rain are the same column of light.         */
+const RAIN = 900;
+const rainPos = new Float32Array(RAIN * 3);
+const rainGeo = new THREE.BufferGeometry();
+rainGeo.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
+const rainTex = (() => {
+  const S = 32, cv = makeCanvas(S), g = cv.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, S);
+  grd.addColorStop(0, 'rgba(210,230,255,0)');
+  grd.addColorStop(0.45, 'rgba(225,240,255,0.85)');
+  grd.addColorStop(1, 'rgba(200,225,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(S * 0.40, 0, S * 0.20, S);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+})();
+const rain = new THREE.Points(rainGeo, new THREE.PointsMaterial({
+  size: 0.52, map: rainTex, transparent: true, depthWrite: false,
+  blending: THREE.AdditiveBlending, sizeAttenuation: true, fog: false
+}));
+rain.material.color.setScalar(1.15);
+rain.frustumCulled = false;
+rain.layers.enable(REFLECT_LAYER);
+scene.add(rain);
+
+const TOP = 24.5;
+const rainState = Array.from({ length: RAIN }, (_, i) => {
+  const a = i * 2.3999, rr = Math.sqrt((i % 97) / 97) * BREACH.r * 0.92;
+  return {
+    x: BREACH.x + Math.cos(a) * rr,
+    z: BREACH.z + Math.sin(a) * rr,
+    y: WATER_Y + ((i * 0.7351) % 1) * (TOP - WATER_Y),
+    v: 5 + ((i * 0.317) % 1) * 4
+  };
+});
+
+let rippleIdx = 0;
+const wake = { x: 0, z: 0, timer: 0, init: false };
+
+/* wading leaves something behind: while the eye is near the surface and
+   actually moving, shed ripples into the same buffer the drips use   */
+function updateWake(dt, t) {
+  const wy = water.position.y;
+  if (!cfg.camera.wake || !cfg.wave.on || Math.abs(camera.position.y - wy) > 1.6) {
+    wake.init = false;
+    return;
+  }
+  if (!wake.init) {
+    wake.x = camera.position.x; wake.z = camera.position.z;
+    wake.init = true; wake.timer = 0;
+    return;
+  }
+  const dx = camera.position.x - wake.x, dz = camera.position.z - wake.z;
+  const speed = Math.hypot(dx, dz) / Math.max(dt, 1e-4);
+  wake.x = camera.position.x; wake.z = camera.position.z;
+  wake.timer -= dt;
+  if (speed < 0.35 || wake.timer > 0) return;
+  wake.timer = 0.14;
+  const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+  // just behind the eye, and only as strong as the wading is fast
+  r.set(camera.position.x - dx * 6, camera.position.z - dz * 6, t,
+        Math.min(0.85, speed * 0.16));
+}
+
+function updateLife(dt, t) {
+  const wy = water.position.y;
+  const amp = cfg.wave.on ? cfg.wave.amp : 0;
+  const wt = t * cfg.wave.speed;
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const e = new THREE.Euler(), s = new THREE.Vector3(1, 1, 1), p = new THREE.Vector3();
+
+  pews.count = cfg.life.pews ? PEWS : 0;
+  if (cfg.life.pews) {
+    for (let i = 0; i < PEWS; i++) {
+      const b = pewState[i];
+      const w = waveAt(b.x, b.z, wt, amp);
+      b.rot += b.spin * dt * 60 * 0.016;
+      e.set(Math.atan(w.nz) * 0.9, b.rot, -Math.atan(w.nx) * 0.9, 'YXZ');
+      p.set(b.x, wy + w.y + b.lift, b.z);
+      pews.setMatrixAt(i, m.compose(p, q.setFromEuler(e), s));
+    }
+    pews.instanceMatrix.needsUpdate = true;
+  }
+
+  const nC = cfg.life.candles ? Math.min(CANDLES, cfg.life.count | 0) : 0;
+  candles.count = nC;
+  flameGeo.setDrawRange(0, nC);
+  for (let i = 0; i < nC; i++) {
+    const c = candleState[i];
+    const w = waveAt(c.x, c.z, wt, amp);
+    const y = wy + w.y - 0.055;
+    p.set(c.x, y, c.z);
+    e.set(Math.atan(w.nz) * 0.5, 0, -Math.atan(w.nx) * 0.5, 'YXZ');
+    candles.setMatrixAt(i, m.compose(p, q.setFromEuler(e), s));
+    // flame flicker: two incommensurate rates, so it never pulses
+    c.flick = 0.78 + Math.sin(t * 7.3 + c.ph) * 0.13 + Math.sin(t * 17.1 + c.ph * 2.3) * 0.09;
+    flamePos[i * 3]     = c.x;
+    flamePos[i * 3 + 1] = y + 0.175 + c.flick * 0.012;
+    flamePos[i * 3 + 2] = c.z;
+  }
+  candles.instanceMatrix.needsUpdate = true;
+  flameGeo.attributes.position.needsUpdate = true;
+  flames.visible = nC > 0;
+  candleLights.forEach(({ light, idx }) => {
+    const on = idx < nC;
+    light.visible = on && cfg.life.candleLights;
+    if (!on) return;
+    const c = candleState[idx];
+    light.position.set(flamePos[idx * 3], flamePos[idx * 3 + 1] + 0.06, flamePos[idx * 3 + 2]);
+    light.intensity = cfg.life.candleGlow * c.flick * sunCandle;
+  });
+
+  // bats: lissajous under the vault, nose along the velocity
+  const nB = cfg.life.bats ? BATS : 0;
+  bats.count = nB;
+  for (let i = 0; i < nB; i++) {
+    const b = batState[i];
+    const a = t * b.sp + b.ph;
+    const px = b.cx + Math.cos(a) * b.ra;
+    const pz = b.cz + Math.sin(a * 1.31) * b.rb;
+    const py = b.y + Math.sin(a * 0.83 + b.ph) * b.bob;
+    const a2 = a + 0.02;                              // one step ahead
+    const vx = b.cx + Math.cos(a2) * b.ra - px;
+    const vz = b.cz + Math.sin(a2 * 1.31) * b.rb - pz;
+    const fl = Math.sin(t * b.flap + b.ph);
+    e.set(0, Math.atan2(vx, vz), fl * 0.45, 'YXZ');
+    s.set(0.42 + 0.58 * Math.abs(fl), 1, 1);          // the flap
+    p.set(px, py, pz);
+    bats.setMatrixAt(i, m.compose(p, q.setFromEuler(e), s));
+  }
+  if (nB) bats.instanceMatrix.needsUpdate = true;
+  s.set(1, 1, 1);
+
+  // rain: falls only inside the breach, splashes a ring now and then
+  const nR = cfg.rain.on ? Math.min(RAIN, cfg.rain.count | 0) : 0;
+  rain.visible = nR > 0;
+  rainGeo.setDrawRange(0, nR);
+  sky.visible = cfg.rain.daylight > 0;
+  sky.intensity = cfg.rain.daylight * sunSky;   // the breach dims with the day
+  for (let i = 0; i < nR; i++) {
+    const d = rainState[i];
+    d.y -= d.v * cfg.rain.speed * dt;
+    const surf = wy + waveAt(d.x, d.z, wt, amp).y;
+    if (d.y <= surf) {
+      d.y = TOP;
+      // one ring in every twenty-odd, or the buffer is all rain
+      if ((i & 31) === 0) {
+        const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+        r.set(d.x, d.z, t, 0.42);
+      }
+    }
+    rainPos[i * 3] = d.x;
+    rainPos[i * 3 + 1] = d.y;
+    rainPos[i * 3 + 2] = d.z;
+  }
+  if (nR) rainGeo.attributes.position.needsUpdate = true;
+
+  // drips
+  const on = cfg.life.drips;
+  drips.visible = on;
+  if (on) for (let i = 0; i < DRIPS; i++) {
+    const d = dripState[i];
+    if (d.wait > 0) {
+      d.wait -= dt * cfg.life.dripRate;
+      dripPos[i * 3 + 1] = -999;
+      continue;
+    }
+    if (d.v === 0 && d.y === 0) { d.y = 19.6 - (i % 5) * 0.55; d.v = 0.2; }
+    d.v += 9.81 * dt * 0.55;
+    d.y -= d.v * dt;
+    const surf = wy + waveAt(d.x, d.z, wt, amp).y;
+    if (d.y <= surf) {
+      const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+      r.set(d.x, d.z, t, 1.0);
+      audio.drip(d.x, d.z, 1.0);
+      d.y = 0; d.v = 0; d.wait = 2.5 + (i * 0.37) % 5.5;
+      dripPos[i * 3 + 1] = -999;
+      continue;
+    }
+    dripPos[i * 3]     = d.x;
+    dripPos[i * 3 + 1] = d.y;
+    dripPos[i * 3 + 2] = d.z;
+  }
+  dripGeo.attributes.position.needsUpdate = true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   VOLUMETRIC SHAFTS — half res, 32 steps, Bayer-offset ray start.
+   Each step samples the rose texture, so a ruby beam stays separate
+   from a cobalt one. That is the whole point of the pass.
+   ═══════════════════════════════════════════════════════════════════ */
+let VOL_SCALE = 0.5;
+const dbs = new THREE.Vector2();
+renderer.getDrawingBufferSize(dbs);
+
+const sceneRT = new THREE.WebGLRenderTarget(dbs.x, dbs.y, {
+  type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter
+});
+sceneRT.depthTexture = new THREE.DepthTexture(dbs.x, dbs.y, THREE.UnsignedIntType);
+
+const volRT = new THREE.WebGLRenderTarget(
+  Math.ceil(dbs.x * VOL_SCALE), Math.ceil(dbs.y * VOL_SCALE),
+  { type: THREE.HalfFloatType, depthBuffer: false });
+
+/* The scene minus the water, kept aside for the water to refract.
+   Colour in rgb, linear depth over far in alpha — packing them into one
+   target means one blit and, more importantly, no feedback loop: the
+   water draws into sceneRT while sampling this copy, never sceneRT's
+   own depth attachment.                                             */
+const refractRT = new THREE.WebGLRenderTarget(dbs.x, dbs.y, {
+  type: THREE.HalfFloatType, minFilter: THREE.LinearFilter,
+  magFilter: THREE.LinearFilter, depthBuffer: false
+});
+
+const copyMat = new THREE.RawShaderMaterial({
+  glslVersion: THREE.GLSL3,
+  uniforms: {
+    tSrc: { value: sceneRT.texture }, tDepth: { value: sceneRT.depthTexture },
+    uNear: { value: camera.near }, uFar: { value: camera.far }
+  },
+  vertexShader: `in vec3 position; in vec2 uv; out vec2 vUv;
+    void main(){ vUv = uv; gl_Position = vec4(position.xy * 2.0, 0.0, 1.0); }`,
+  fragmentShader: `precision highp float;
+    in vec2 vUv; out vec4 o;
+    uniform sampler2D tSrc, tDepth;
+    uniform float uNear, uFar;
+    void main(){
+      float d = texture(tDepth, vUv).x;
+      float vz = (uNear * uFar) / ((uFar - uNear) * d - uFar);   // negative
+      o = vec4(texture(tSrc, vUv).rgb, clamp(-vz / uFar, 0.0, 1.0));
+    }`
+});
+const copyQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), copyMat);
+const copyScene = new THREE.Scene().add(copyQuad);
+
+const volUniforms = {
+  tDepth:      { value: sceneRT.depthTexture },
+  uSpotMap:    { value: roseTex },
+  uSpotShadow: proj.uSpotShadow,
+  uSpotMat:    proj.uSpotMat,
+  uInvProj:    { value: new THREE.Matrix4() },
+  uCamW:       { value: new THREE.Matrix4() },
+  uCamPos:     { value: new THREE.Vector3() },
+  uSpotPos:    { value: new THREE.Vector3() },
+  uSpotDir:    { value: new THREE.Vector3() },
+  uSpotI:      { value: spot.intensity },
+  uCone:       { value: new THREE.Vector2() },
+  uNear:       { value: camera.near },
+  uFar:        { value: camera.far },
+  uWaterY:     { value: WATER_Y },
+  uDens:       { value: new THREE.Vector2(0.020, 0.14) },  // extinction: air, water
+  uScat:       { value: new THREE.Vector2(0.55, 0.16) },   // scattering albedo
+  uHG:         { value: 0.65 },
+  uSteps:      { value: 32 },
+  uGain:       { value: 0.06 },
+  // the breach light, marched alongside the rose
+  uSkyPos:     { value: new THREE.Vector3() },
+  uSkyDir:     { value: new THREE.Vector3(0, -1, 0) },
+  uSkyCol:     { value: new THREE.Color(0xd7e4ff) },
+  uSkyCone:    { value: new THREE.Vector2() },
+  uSkyI:       { value: 0 },
+  uSkyG:       { value: 0.12 },
+  uSkyMat:     { value: sky.shadow.matrix },
+  uSkyShadow:  { value: null }
+};
+
+const volMat = new THREE.RawShaderMaterial({
+  uniforms: volUniforms,
+  glslVersion: THREE.GLSL3,
+  vertexShader: /* glsl */`
+    in vec3 position; in vec2 uv; out vec2 vUv;
+    void main(){ vUv = uv; gl_Position = vec4(position.xy * 2.0, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float; precision highp int;
+    in vec2 vUv; out vec4 fragColor;
+    uniform sampler2D tDepth, uSpotMap, uSpotShadow, uSkyShadow;
+    uniform mat4 uSpotMat, uInvProj, uCamW, uSkyMat;
+    uniform vec3 uCamPos, uSpotPos, uSpotDir, uSkyPos, uSkyDir, uSkyCol;
+    uniform vec2 uCone, uDens, uScat, uSkyCone;
+    uniform float uSpotI, uNear, uFar, uWaterY, uGain, uHG, uSkyI, uSkyG;
+    uniform int uSteps;
+
+    const float PI = 3.141592653589793;
+
+    float unpackDepth(vec4 v) {
+      return dot(v, vec4(1.0/16777216.0, 1.0/65536.0, 1.0/256.0, 1.0) * (255.0/256.0));
+    }
+    float viewZ(float d) {                       // window depth → view z (negative)
+      return (uNear * uFar) / ((uFar - uNear) * d - uFar);
+    }
+    float hgG(float c, float g) {
+      float g2 = g * g;
+      return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+    }
+    float hg(float c) { return hgG(c, uHG); }
+    // 4×4 Bayer: removes the banding without laying noise over the image
+    float bayer(vec2 p) {
+      const mat4 B = mat4( 0.0,  8.0,  2.0, 10.0,
+                          12.0,  4.0, 14.0,  6.0,
+                           3.0, 11.0,  1.0,  9.0,
+                          15.0,  7.0, 13.0,  5.0);
+      ivec2 i = ivec2(mod(p, 4.0));
+      return B[i.x][i.y] / 16.0;
+    }
+    vec3 roseAt(vec3 wp) {
+      vec4 sp = uSpotMat * vec4(wp, 1.0);
+      if (sp.w <= 0.0) return vec3(0.0);
+      vec3 c = sp.xyz / sp.w;
+      if (any(lessThan(c.xy, vec2(0.001))) || any(greaterThan(c.xy, vec2(0.999)))) return vec3(0.0);
+      if (c.z > 1.0) return vec3(0.0);
+      float sd = unpackDepth(texture(uSpotShadow, c.xy));
+      return texture(uSpotMap, c.xy).rgb * step(c.z - 0.0025, sd);
+    }
+
+    void main() {
+      vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+      vec3 ray = vp.xyz / vp.w;
+      ray /= -ray.z;                              // view ray with z = −1
+      float rl = length(ray);
+      vec3 dirW = normalize(mat3(uCamW) * normalize(ray));
+
+      float d = texture(tDepth, vUv).x;
+      float tMax = (d >= 0.9999) ? 90.0 : min(90.0, -viewZ(d) * rl);
+
+      float t0 = 0.4;
+      if (tMax <= t0) { fragColor = vec4(0.0); return; }
+      float dt = (tMax - t0) / float(uSteps);
+      float j  = bayer(gl_FragCoord.xy);
+
+      vec3 acc = vec3(0.0);
+      float trans = 1.0;
+      for (int i = 0; i < uSteps; i++) {
+        float t = t0 + (float(i) + j) * dt;
+        vec3 p = uCamPos + dirW * t;
+        bool  sub  = p.y < uWaterY;
+        float dens = sub ? uDens.y : uDens.x;
+        float scat = sub ? uScat.y : uScat.x;
+
+        vec3 L = uSpotPos - p;
+        float dl = length(L);
+        L /= dl;
+        float att = smoothstep(uCone.x, uCone.y, dot(-L, uSpotDir));
+        if (att > 0.0) {
+          vec3 lc = roseAt(p) * (uSpotI / (dl * dl)) * att;
+          acc += trans * lc * hg(dot(dirW, -L)) * dens * scat * dt;
+        }
+
+        if (uSkyI > 0.0) {                   // daylight through the breach
+          vec3 L2 = uSkyPos - p;
+          float dl2 = length(L2);
+          L2 /= dl2;
+          float att2 = smoothstep(uSkyCone.x, uSkyCone.y, dot(-L2, uSkyDir));
+          if (att2 > 0.0) {
+            vec4 sp2 = uSkyMat * vec4(p, 1.0);
+            float vis2 = 0.0;
+            if (sp2.w > 0.0) {
+              vec3 c2 = sp2.xyz / sp2.w;
+              if (all(greaterThan(c2.xy, vec2(0.001))) &&
+                  all(lessThan(c2.xy, vec2(0.999))) && c2.z <= 1.0)
+                vis2 = step(c2.z - 0.0025, unpackDepth(texture(uSkyShadow, c2.xy)));
+            }
+            /* A vertical shaft is nearly always viewed across its axis,
+               where a forward-peaked phase gives almost nothing. Dust in
+               a real light column scatters far more evenly than that, so
+               this light gets its own, nearly isotropic phase.       */
+            vec3 lc2 = uSkyCol * (uSkyI / (dl2 * dl2)) * att2 * vis2;
+            acc += trans * lc2 * hgG(dot(dirW, -L2), uSkyG) * dens * scat * dt;
+          }
+        }
+        trans *= exp(-dens * dt);
+        if (trans < 0.004) break;
+      }
+      fragColor = vec4(acc * uGain, 1.0);
+    }
+  `
+});
+
+const volQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), volMat);
+const volScene = new THREE.Scene().add(volQuad);
+const volCam = new THREE.Camera();
+
+function renderVolumetrics() {
+  volUniforms.uInvProj.value.copy(camera.projectionMatrixInverse);
+  volUniforms.uCamW.value.copy(camera.matrixWorld);
+  volUniforms.uCamPos.value.copy(camera.position);
+  volUniforms.uSpotPos.value.copy(spot.position);
+  volUniforms.uSpotDir.value.copy(spot.target.position).sub(spot.position).normalize();
+  volUniforms.uCone.value.set(Math.cos(spot.angle),
+                              Math.cos(spot.angle * (1 - spot.penumbra)));
+  volUniforms.uSkyPos.value.copy(sky.position);
+  volUniforms.uSkyDir.value.copy(sky.target.position).sub(sky.position).normalize();
+  volUniforms.uSkyCone.value.set(Math.cos(sky.angle),
+                                 Math.cos(sky.angle * (1 - sky.penumbra)));
+  // the shaft carries its own gain: surface lighting and in-scatter want
+  // very different numbers once the phase function is this flat
+  volUniforms.uSkyI.value = sky.visible ? sky.intensity * cfg.rain.shaft : 0;
+  if (!volUniforms.uSkyShadow.value && sky.shadow.map)
+    volUniforms.uSkyShadow.value = sky.shadow.map.texture;
+  renderer.setRenderTarget(volRT);
+  renderer.render(volScene, volCam);
+  renderer.setRenderTarget(null);
+}
+
+/* ── composite: bilateral upsample by depth, then the underwater grade ── */
+const CompositeShader = {
+  uniforms: {
+    tScene: { value: sceneRT.texture },
+    tVol:   { value: volRT.texture },
+    tDepth: { value: sceneRT.depthTexture },
+    uTexel: { value: new THREE.Vector2() },
+    uUnder: { value: 0 },
+    uVolOn: { value: 1 },
+    uSat:   { value: 1.8 }
+  },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene, tVol, tDepth;
+    uniform vec2 uTexel;
+    uniform float uUnder, uVolOn, uSat;
+    varying vec2 vUv;
+    void main() {
+      float dc = texture2D(tDepth, vUv).x;
+      vec3 sum = vec3(0.0);
+      float wsum = 0.0;
+      if (uVolOn < 0.5) { sum = vec3(0.0); wsum = 1.0; } else
+      for (int y = -1; y <= 1; y += 2) for (int x = -1; x <= 1; x += 2) {
+        vec2 o = vec2(float(x), float(y)) * uTexel;
+        float dn = texture2D(tDepth, vUv + o).x;
+        float w  = 1.0 / (1.0e-4 + abs(dn - dc) * 260.0);
+        sum  += texture2D(tVol, vUv + o).rgb * w;
+        wsum += w;
+      }
+      vec3 shafts = sum / max(wsum, 1e-4);
+      // the ray integral averages many glass cells toward white; pull the
+      // ruby and cobalt back apart so the beams stay distinguishable
+      float sl = dot(shafts, vec3(0.2126, 0.7152, 0.0722));
+      shafts = max(mix(vec3(sl), shafts, uSat), 0.0);
+      vec3 col = texture2D(tScene, vUv).rgb + shafts;
+      if (uUnder > 0.001) {                     // slightly less saturated below
+        float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        col = mix(col, vec3(l), 0.18 * uUnder) * mix(vec3(1.0), vec3(0.86, 1.0, 1.06), uUnder);
+      }
+      gl_FragColor = vec4(col, 1.0);
+    }`
+};
+
+const composer = new EffectComposer(renderer);
+const compositePass = new ShaderPass(CompositeShader);
+// ShaderPass clones its uniforms, and cloneUniforms() nulls any render
+// target texture — rebind them by hand
+compositePass.uniforms.tScene.value = sceneRT.texture;
+compositePass.uniforms.tVol.value   = volRT.texture;
+compositePass.uniforms.tDepth.value = sceneRT.depthTexture;
+composer.addPass(compositePass);
+const bloom = new UnrealBloomPass(new THREE.Vector2(dbs.x, dbs.y), 0.55, 0.7, 0.85);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+const smaaPass = new SMAAPass();
+composer.addPass(smaaPass);
+
+onResize = () => {
+  renderer.getDrawingBufferSize(dbs);
+  sceneRT.setSize(dbs.x, dbs.y);
+  refractRT.setSize(dbs.x, dbs.y);
+  waterUniforms.uRes.value.set(dbs.x, dbs.y);
+  volRT.setSize(Math.ceil(dbs.x * VOL_SCALE), Math.ceil(dbs.y * VOL_SCALE));
+  composer.setSize(innerWidth, innerHeight);
+  bloom.setSize(dbs.x, dbs.y);
+  sizeReflect();
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+   SETTINGS — every number that shapes the image, live
+   ═══════════════════════════════════════════════════════════════════ */
+const hud = document.getElementById('hud');
+
+const cfg = {
+  preset: 'High',
+  look:   'Vespers',
+  render: { scale: Math.min(devicePixelRatio, 1.5), exposure: 1.0, tone: 'AgX',
+            fov: 52, shadows: true, shadowMap: 2048,
+            fog: '#0a2836', fogDensity: 0.055 },
+  camera: { mode: 'cinematic', speed: 1.0, look: 15,
+            bounds: true, walk: false, eye: 5.0, wake: true },
+  photo:  { scale: 2.0 },
+  light:  { rose: spot.intensity, angle: spot.angle, penumbra: spot.penumbra,
+            kelvin: 6500, glass: 2.2, fill: 430, ambient: 0.64, sway: false,
+            sunX: 0, sunY: 17 },
+  stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff' },
+  life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
+            pews: true, drips: true, dripRate: 1.0, bats: true },
+  audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
+  rain:   { on: true, count: 240, speed: 1.0, daylight: 7000, shaft: 9 },
+  sun:    { cycle: true, length: 90 },
+  vol:    { on: true, steps: 32, scale: 0.5, air: 0.020, water: 0.14,
+            albedoAir: 0.85, albedoWater: 0.30, g: 0.65, gain: 0.34, sat: 1.8 },
+  wave:   { on: true, level: WATER_Y, amp: 1.0, steep: 1.0, speed: 1.0,
+            detail: 0.16, absorb: 0.040, reflect: true, reflScale: 0.5,
+            segments: 400, deep: '#0a2836' },
+  caust:  { gain: 2.2, scale: 1.0, speed: 1.0 },
+  post:   { bloom: 0.55, radius: 0.7, threshold: 0.85, smaa: true },
+  stats:  true
+};
+const DEFAULTS = JSON.parse(JSON.stringify(cfg));
+
+const KELVIN = k => {                                  // Tanner Helland fit
+  const t = k / 100;
+  const c = (v) => THREE.MathUtils.clamp(v, 0, 255) / 255;
+  const r = t <= 66 ? 255 : 329.7 * Math.pow(t - 60, -0.1332);
+  const g = t <= 66 ? 99.47 * Math.log(t) - 161.12 : 288.12 * Math.pow(t - 60, -0.0755);
+  const b = t >= 66 ? 255 : (t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.045);
+  return new THREE.Color(c(r), c(g), c(b)).convertSRGBToLinear();
+};
+const TONE = {
+  AgX: THREE.AgXToneMapping, ACES: THREE.ACESFilmicToneMapping,
+  Neutral: THREE.NeutralToneMapping, Reinhard: THREE.ReinhardToneMapping,
+  Linear: THREE.LinearToneMapping, None: THREE.NoToneMapping
+};
+
+function applySize() {
+  renderer.setPixelRatio(cfg.render.scale);
+  renderer.setSize(innerWidth, innerHeight);
+  onResize();
+}
+function applyShadowMap() {
+  spot.castShadow = cfg.render.shadows;
+  spot.shadow.mapSize.setScalar(cfg.render.shadowMap);
+  if (spot.shadow.map) { spot.shadow.map.dispose(); spot.shadow.map = null; }
+  proj.uSpotShadow.value = null;
+}
+function setWaterLevel(y) {
+  cfg.wave.level = y;
+  water.position.y = y;
+  proj.uWaterY.value = y;
+  waterUniforms.uWaterY.value = y;
+  volUniforms.uWaterY.value = y;
+  clipAbove.constant = -y;
+}
+const applyAll = () => {
+  const r = cfg.render, l = cfg.light, v = cfg.vol, w = cfg.wave, c = cfg.caust, p = cfg.post;
+  renderer.toneMapping = TONE[r.tone];
+  renderer.toneMappingExposure = r.exposure;
+  camera.fov = r.fov; camera.updateProjectionMatrix();
+  volUniforms.uNear.value = camera.near; volUniforms.uFar.value = camera.far;
+
+  spot.intensity = l.rose;  volUniforms.uSpotI.value = l.rose;
+  spot.angle = l.angle; spot.penumbra = l.penumbra;
+  spot.color.copy(KELVIN(l.kelvin));
+  roseDisc.material.color.copy(KELVIN(l.kelvin)).multiplyScalar(l.glass);
+  fillLights.forEach(f => f.intensity = l.fill);
+  hemi.intensity = l.ambient;
+
+  volPassOn = v.on;
+  volUniforms.uSteps.value = v.steps | 0;
+  volUniforms.uDens.value.set(v.air, v.water);
+  volUniforms.uScat.value.set(v.albedoAir, v.albedoWater);
+  volUniforms.uHG.value = v.g;
+  volUniforms.uGain.value = v.gain;
+  compositePass.uniforms.uSat.value = v.sat;
+
+  spot.position.set(l.sunX, l.sunY, -34);
+
+  const st = cfg.stone;
+  proj.uStone.value.set(st.scale, st.rough, st.relief);
+  matStone.color.set(st.tint);
+  matFloor.normalScale.set(st.relief * 0.6, st.relief * 0.6);
+
+  water.visible = w.on;
+  waterUniforms.uWave.value.set(w.amp, w.steep, w.speed, w.detail);
+  waterUniforms.uAbsorb.value = w.absorb;
+  waterUniforms.uDeep.value.set(w.deep).convertSRGBToLinear();
+  proj.uCaustic.value.set(c.gain, c.scale, c.speed);
+  if (waterSegments !== w.segments) rebuildWater(w.segments);
+
+  scene.fog.color.set(r.fog).convertSRGBToLinear();
+
+  bloom.strength = p.bloom; bloom.radius = p.radius; bloom.threshold = p.threshold;
+  smaaPass.enabled = p.smaa;
+  stats.dom.style.display = cfg.stats ? '' : 'none';
+  saveSoon();
+};
+
+/* the water plane is the heaviest mesh in the scene — its tessellation
+   is a real performance lever, so it is a preset field, not a constant */
+let waterSegments = 400;
+function rebuildWater(n) {
+  waterSegments = n;
+  const g = new THREE.PlaneGeometry(28, (Z1 - Z0) + 6, n, n);
+  g.rotateX(-Math.PI / 2);
+  water.geometry.dispose();
+  water.geometry = g;
+}
+
+/* ── quality: cost only. Every tier keeps the planar reflection and the
+      shafts, because dropping either stops being the same picture. What
+      changes is resolution, ray count and water tessellation.        ── */
+const PRESETS = {
+  Low:      { scale: 0.72, shadowMap: 1024, steps: 14, volScale: 0.34,
+              reflScale: 0.30, segments: 128, smaa: false },
+  Balanced: { scale: 1.0,  shadowMap: 1536, steps: 22, volScale: 0.42,
+              reflScale: 0.42, segments: 256, smaa: true },
+  High:     { scale: Math.min(devicePixelRatio, 1.5), shadowMap: 2048, steps: 32,
+              volScale: 0.5,  reflScale: 0.5,  segments: 400, smaa: true },
+  Ultra:    { scale: Math.min(devicePixelRatio, 2), shadowMap: 4096, steps: 64,
+              volScale: 0.8,  reflScale: 0.8,  segments: 512, smaa: true }
+};
+function applyPreset(name) {
+  const p = PRESETS[name]; if (!p) return;
+  cfg.preset = name;
+  cfg.render.scale = p.scale;
+  cfg.render.shadowMap = p.shadowMap;
+  cfg.vol.on = true;
+  cfg.vol.steps = p.steps;
+  cfg.vol.scale = p.volScale;
+  cfg.wave.reflect = true;
+  cfg.wave.reflScale = p.reflScale;
+  cfg.wave.segments = p.segments;
+  cfg.post.smaa = p.smaa;
+  VOL_SCALE = cfg.vol.scale;
+  REFL_SCALE = cfg.wave.reflScale;
+  applyShadowMap(); applySize(); applyAll(); guiRefresh();
+}
+
+/* ── looks: art direction. Six coherent grades — each one moves the sun,
+      the glass, the haze, the water and the bloom together, because
+      changing one without the others just makes it wrong.            ── */
+const LOOKS = {
+  // the brief: a low sun, dusty air, warm stone
+  Vespers: {
+    render: { exposure: 1.00, fog: '#0a2836', fogDensity: 0.055 },
+    light:  { kelvin: 6500, glass: 2.2, fill: 430, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
+    vol:    { gain: 0.34, air: 0.020, water: 0.14, g: 0.65, sat: 1.8 },
+    wave:   { absorb: 0.040, deep: '#0a2836', amp: 1.0, detail: 0.16 },
+    caust:  { gain: 2.2 },
+    post:   { bloom: 0.55, radius: 0.70, threshold: 0.85 }
+  },
+  // the last twenty minutes of light: sun almost on the horizon, thick air
+  Ember: {
+    render: { exposure: 1.12, fog: '#241a12', fogDensity: 0.050 },
+    light:  { kelvin: 3050, glass: 2.8, fill: 300, ambient: 0.30, sunX: -3.4, sunY: 12.5, angle: 0.40 },
+    vol:    { gain: 0.62, air: 0.031, water: 0.17, g: 0.74, sat: 2.1 },
+    wave:   { absorb: 0.080, deep: '#1d1409', amp: 0.75, detail: 0.13 },
+    caust:  { gain: 2.9 },
+    post:   { bloom: 0.80, radius: 0.78, threshold: 0.74 }
+  },
+  // clear cold morning, clean water, the floor legible all the way down
+  Aurora: {
+    render: { exposure: 1.05, fog: '#07323e', fogDensity: 0.038 },
+    light:  { kelvin: 9200, glass: 2.0, fill: 900, ambient: 0.72, sunX: 2.6, sunY: 19.5, angle: 0.44 },
+    vol:    { gain: 0.26, air: 0.015, water: 0.10, g: 0.58, sat: 1.6 },
+    wave:   { absorb: 0.032, deep: '#06323e', amp: 1.25, detail: 0.22 },
+    caust:  { gain: 3.4 },
+    post:   { bloom: 0.48, radius: 0.64, threshold: 0.90 }
+  },
+  // deep and quiet: almost no fill, heavy water, the rose the only thing alive
+  Abyss: {
+    render: { exposure: 0.78, fog: '#04161f', fogDensity: 0.090 },
+    light:  { kelvin: 5200, glass: 1.7, fill: 180, ambient: 0.20, sunX: 0, sunY: 20.5, angle: 0.38 },
+    vol:    { gain: 0.24, air: 0.013, water: 0.27, g: 0.70, sat: 2.0 },
+    wave:   { absorb: 0.115, deep: '#03131c', amp: 0.65, detail: 0.10 },
+    caust:  { gain: 1.7 },
+    post:   { bloom: 0.46, radius: 0.62, threshold: 0.90 }
+  },
+  // mist off the water, the beams blown wide and pale
+  Requiem: {
+    render: { exposure: 0.96, fog: '#1b2430', fogDensity: 0.062 },
+    light:  { kelvin: 5900, glass: 2.5, fill: 760, ambient: 0.66, sunX: 0, sunY: 15.5, angle: 0.46 },
+    vol:    { gain: 0.52, air: 0.036, water: 0.16, g: 0.55, sat: 1.25 },
+    wave:   { absorb: 0.072, deep: '#1a232e', amp: 0.85, detail: 0.14 },
+    caust:  { gain: 1.9 },
+    post:   { bloom: 0.95, radius: 0.86, threshold: 0.70 }
+  },
+  // high sun, crisp air, caustics doing the work instead of haze
+  Meridian: {
+    render: { exposure: 1.00, fog: '#0d3b47', fogDensity: 0.042 },
+    light:  { kelvin: 6800, glass: 1.9, fill: 1150, ambient: 0.92, sunX: 0, sunY: 21, angle: 0.45 },
+    vol:    { gain: 0.17, air: 0.010, water: 0.09, g: 0.60, sat: 1.5 },
+    wave:   { absorb: 0.028, deep: '#0c3a46', amp: 1.4, detail: 0.26 },
+    caust:  { gain: 3.8 },
+    post:   { bloom: 0.42, radius: 0.60, threshold: 0.92 }
+  }
+};
+function applyLook(name) {
+  const L = LOOKS[name]; if (!L) return;
+  cfg.look = name;
+  for (const group in L) Object.assign(cfg[group], L[group]);
+  applyAll(); guiRefresh();
+}
+
+/* ── persistence ──────────────────────────────────────────────────
+   Merged key by key against the defaults, so a stored blob from an
+   older build can never introduce a key the code no longer reads or
+   drop one it now needs.                                          */
+const STORE = 'navis.settings.v1';
+let saveTimer = 0, storeReady = false;
+
+function saveSoon() {
+  if (!storeReady) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { localStorage.setItem(STORE, JSON.stringify(cfg)); } catch (e) { /* private mode */ }
+  }, 300);
+}
+function mergeInto(dst, src, ref) {
+  for (const k in ref) {
+    if (!(k in src)) continue;
+    if (ref[k] && typeof ref[k] === 'object') mergeInto(dst[k], src[k], ref[k]);
+    else if (typeof src[k] === typeof ref[k]) dst[k] = src[k];
+  }
+}
+function loadSettings() {
+  let raw;
+  try { raw = localStorage.getItem(STORE); } catch (e) { return false; }
+  if (!raw) return false;
+  try { mergeInto(cfg, JSON.parse(raw), DEFAULTS); } catch (e) { return false; }
+  return true;
+}
+function resetSettings() {
+  try { localStorage.removeItem(STORE); } catch (e) { /* ignore */ }
+  mergeInto(cfg, DEFAULTS, DEFAULTS);
+  cfg.camera.mode = 'cinematic';
+  VOL_SCALE = cfg.vol.scale;
+  REFL_SCALE = cfg.wave.reflScale;
+  setWaterLevel(cfg.wave.level);
+  applyShadowMap(); applySize(); applyAll(); setMode('cinematic'); guiRefresh();
+}
+
+const stats = new Stats();
+stats.dom.style.cssText = 'position:fixed;left:12px;top:12px;z-index:20';
+document.body.appendChild(stats.dom);
+
+/* ── photo mode ────────────────────────────────────────────────────
+   P clears the screen of everything that is not the scene and puts you
+   on the free camera at a higher render scale; Enter saves the frame.
+   The grab has to happen in the same task as the draw — without
+   preserveDrawingBuffer the buffer is gone by the next one.       */
+let photo = false, photoRestore = null;
+function togglePhoto(on = !photo) {
+  if (on === photo) return;
+  photo = on;
+  if (photo) {
+    photoRestore = { scale: cfg.render.scale, mode: cfg.camera.mode, paused };
+    gui.hide(); stats.dom.style.display = 'none'; hud.style.display = 'none';
+    cfg.render.scale = cfg.photo.scale;
+    applySize();
+    setMode('free');
+    paused = true;
+  } else {
+    gui.show(); hud.style.display = '';
+    stats.dom.style.display = cfg.stats ? '' : 'none';
+    cfg.render.scale = photoRestore.scale;
+    applySize();
+    setMode(photoRestore.mode);
+    paused = photoRestore.paused;
+    guiRefresh();
+  }
+}
+function shoot() {
+  frame(0);                                   // draw, then grab, same task
+  const a = document.createElement('a');
+  a.href = renderer.domElement.toDataURL('image/png');
+  a.download = 'navis-' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
+  a.click();
+}
+
+const gui = new GUI({ title: 'NAVIS' });
+gui.domElement.style.cssText += ';max-height:92vh;overflow:auto';
+const A = applyAll;
+
+gui.add(cfg, 'look', Object.keys(LOOKS)).name('look').onChange(applyLook);
+gui.add(cfg, 'preset', Object.keys(PRESETS)).name('quality').onChange(applyPreset);
+gui.add({ reset: resetSettings }, 'reset').name('reset all settings');
+
+const gr = gui.addFolder('renderer');
+gr.add(cfg.render, 'scale', 0.4, 2, 0.05).name('render scale').onChange(applySize);
+gr.add(cfg.render, 'tone', Object.keys(TONE)).name('tone mapping').onChange(A);
+gr.add(cfg.render, 'exposure', 0.1, 3, 0.01).onChange(A);
+gr.add(cfg.render, 'fov', 30, 90, 1).onChange(A);
+gr.add(cfg.render, 'shadows').onChange(applyShadowMap);
+gr.add(cfg.render, 'shadowMap', [512, 1024, 2048, 4096]).name('shadow map').onChange(applyShadowMap);
+gr.add(cfg, 'stats').name('fps meter').onChange(A);
+
+const gc = gui.addFolder('camera');
+gc.add(cfg.camera, 'mode', ['cinematic', 'free']).onChange(setMode);
+gc.add(cfg.camera, 'speed', 0.1, 4, 0.05).name('path speed');
+gc.add(cfg.camera, 'look', 0, 60, 1).name('mouse look °');
+gc.add(fly, 'speed', 1, 40, 0.5).name('move speed');
+gc.add(cfg.camera, 'walk').name('lock to eye height');
+gc.add(cfg.camera, 'eye', 0.6, 19, 0.1).name('eye height m');
+gc.add(cfg.camera, 'bounds').name('stay inside');
+gc.add(cfg.camera, 'wake').name('leave a wake');
+gc.add({ go: () => setMode('free') }, 'go').name('walk the nave  (F)');
+gc.add({ reset: () => { tPath = 0; setMode('cinematic'); } }, 'reset').name('restart path');
+gc.open();
+
+const gph = gui.addFolder('photo mode');
+gph.add(cfg.photo, 'scale', 1, 4, 0.25).name('render scale');
+gph.add({ enter: () => togglePhoto(true) }, 'enter').name('enter  (P)');
+gph.add({ save: () => shoot() }, 'save').name('save PNG  (Enter)');
+
+const gl = gui.addFolder('light');
+gl.add(cfg.light, 'rose', 0, 120000, 100).name('rose intensity').onChange(A);
+gl.add(cfg.light, 'kelvin', 1800, 12000, 50).name('colour temp K').onChange(A);
+gl.add(cfg.light, 'angle', 0.15, 0.9, 0.005).name('cone angle').onChange(A);
+gl.add(cfg.light, 'penumbra', 0, 1, 0.01).onChange(A);
+gl.add(cfg.light, 'glass', 0, 10, 0.1).name('glass emission').onChange(A);
+gl.add(cfg.light, 'fill', 0, 4000, 20).name('aisle fill').onChange(A);
+gl.add(cfg.light, 'ambient', 0, 2, 0.01).name('hemisphere').onChange(A);
+gl.add(cfg.light, 'sway').name('animate sun');
+gl.add(cfg.sun, 'cycle').name('day cycle');
+gl.add(cfg.sun, 'length', 20, 400, 5).name('cycle seconds');
+gl.add({ dusk: () => { sunT = 0.94; } }, 'dusk').name('jump to dusk');
+
+const gA = gui.addFolder('sound');
+gA.add(cfg.audio, 'on').name('enabled');
+gA.add(cfg.audio, 'master', 0, 1, 0.01).name('volume');
+gA.add(cfg.audio, 'water', 0, 0.2, 0.002).name('water');
+gA.add(cfg.audio, 'drips', 0, 3, 0.05).name('drips');
+gA.add(cfg.audio, 'reverb', 0, 2, 0.02).name('reverb');
+gA.add({ start: () => audio.unlock() }, 'start').name('start audio');
+
+const gL = gui.addFolder('life');
+gL.add(cfg.life, 'candles').name('floating candles');
+gL.add(cfg.life, 'count', 0, 64, 1).name('candle count');
+gL.add(cfg.life, 'candleGlow', 0, 12, 0.1).name('candle light');
+gL.add(cfg.life, 'candleLights').name('cast real light');
+gL.add(cfg.life, 'pews').name('drifting pews');
+gL.add(cfg.life, 'bats').name('bats');
+gL.add(cfg.life, 'drips').name('drips from the vault');
+gL.add(cfg.life, 'dripRate', 0.1, 6, 0.1).name('drip rate');
+
+const gB = gui.addFolder('breach & rain');
+gB.add(cfg.rain, 'on').name('rain');
+gB.add(cfg.rain, 'count', 0, 900, 10).name('drops');
+gB.add(cfg.rain, 'speed', 0.2, 3, 0.05).name('fall speed');
+gB.add(cfg.rain, 'daylight', 0, 40000, 250).name('daylight');
+gB.add(cfg.rain, 'shaft', 0, 60, 0.5).name('shaft density');
+
+const gs = gui.addFolder('marble');
+gs.add(cfg.stone, 'scale', 0.05, 1.2, 0.005).name('vein scale').onChange(A);
+gs.add(cfg.stone, 'rough', 0.2, 2, 0.02).name('roughness ×').onChange(A);
+gs.add(cfg.stone, 'relief', 0, 2, 0.02).name('relief').onChange(A);
+gs.addColor(cfg.stone, 'tint').name('tint').onChange(A);
+
+const gv = gui.addFolder('volumetric shafts');
+gv.add(cfg.vol, 'on').name('enabled').onChange(A);
+gv.add(cfg.vol, 'steps', 4, 128, 1).onChange(A);
+gv.add(cfg.vol, 'scale', 0.2, 1, 0.05).name('resolution')
+  .onChange(v => { VOL_SCALE = v; onResize(); });
+gv.add(cfg.vol, 'gain', 0, 0.4, 0.002).name('intensity').onChange(A);
+gv.add(cfg.vol, 'air', 0, 0.12, 0.001).name('density air').onChange(A);
+gv.add(cfg.vol, 'water', 0, 0.5, 0.005).name('density water').onChange(A);
+gv.add(cfg.vol, 'albedoAir', 0, 1, 0.01).name('scatter air').onChange(A);
+gv.add(cfg.vol, 'albedoWater', 0, 1, 0.01).name('scatter water').onChange(A);
+gv.add(cfg.vol, 'g', -0.9, 0.95, 0.01).name('anisotropy g').onChange(A);
+gv.add(cfg.vol, 'sat', 0, 3, 0.05).name('beam saturation').onChange(A);
+
+const gw = gui.addFolder('water');
+gw.add(cfg.wave, 'on').name('enabled').onChange(A);
+gw.add(cfg.wave, 'level', 0.5, 9, 0.05).name('level m').onChange(setWaterLevel);
+gw.add(cfg.wave, 'amp', 0, 4, 0.05).name('wave height').onChange(A);
+gw.add(cfg.wave, 'steep', 0, 3, 0.05).name('steepness').onChange(A);
+gw.add(cfg.wave, 'speed', 0, 4, 0.05).name('wave speed').onChange(A);
+gw.add(cfg.wave, 'detail', 0, 0.8, 0.01).name('detail normals').onChange(A);
+gw.add(cfg.wave, 'absorb', 0.01, 0.6, 0.005).name('absorption').onChange(A);
+gw.add(cfg.wave, 'reflect').name('planar reflection');
+gw.add(cfg.wave, 'reflScale', 0.2, 1, 0.05).name('reflection res')
+  .onChange(v => { REFL_SCALE = v; onResize(); });
+gw.add(cfg.wave, 'segments', [64, 128, 256, 400, 512]).name('tessellation').onChange(A);
+gw.addColor(cfg.wave, 'deep').name('deep colour').onChange(A);
+
+const gk = gui.addFolder('caustics');
+gk.add(cfg.caust, 'gain', 0, 8, 0.05).name('intensity').onChange(A);
+gk.add(cfg.caust, 'scale', 0.2, 4, 0.05).onChange(A);
+gk.add(cfg.caust, 'speed', 0, 4, 0.05).onChange(A);
+
+const gp = gui.addFolder('post');
+gp.add(cfg.post, 'bloom', 0, 2, 0.01).name('bloom strength').onChange(A);
+gp.add(cfg.post, 'radius', 0, 1.5, 0.01).name('bloom radius').onChange(A);
+gp.add(cfg.post, 'threshold', 0, 1.5, 0.01).name('bloom threshold').onChange(A);
+gp.add(cfg.post, 'smaa').name('SMAA').onChange(A);
+
+const gf = gui.addFolder('underwater');
+gf.addColor(cfg.render, 'fog').name('fog colour').onChange(A);
+gf.add(cfg.render, 'fogDensity', 0, 0.2, 0.002).name('fog density').onChange(A);
+gf.add(cfg.light, 'sunX', -5, 5, 0.1).name('sun x').onChange(A);
+gf.add(cfg.light, 'sunY', 11, 21, 0.1).name('sun height').onChange(A);
+
+gv.close(); gw.close(); gk.close(); gp.close(); gr.close();
+gf.close(); gs.close(); gL.close(); gA.close(); gph.close(); gB.close();
+
+function guiRefresh() { gui.controllersRecursive().forEach(c => c.updateDisplay()); }
+let volPassOn = true;
+
+/* ── the day, in ninety seconds ────────────────────────────────────
+   dusk → noon → dusk, so one loop of the camera is one loop of the
+   light and the seam never shows. Applied over the panel's values
+   rather than into them, or the cycle would overwrite what you set
+   and then save it.                                              */
+let sunT = 0.5;
+const SUN = {
+  kelvin: [2250, 6600], rose: [0.30, 1.00], height: [12.0, 19.5],
+  ambient: [0.34, 1.00], candle: [2.30, 1.00], day: [0.18, 1.00]
+};
+function driveSun(dt) {
+  const L = cfg.light, w = SUN;
+  if (!cfg.sun.cycle) { sunSky = 1; sunCandle = 1; return; }
+  if (!paused) sunT = (sunT + dt / Math.max(4, cfg.sun.length)) % 1;
+  const k = Math.sin(Math.PI * sunT);           // 0 at both ends, 1 mid-loop
+  const e = k * k * (3 - 2 * k);
+  const mix = (r) => r[0] + (r[1] - r[0]) * e;
+
+  spot.color.copy(KELVIN(mix(w.kelvin)));
+  spot.intensity = L.rose * mix(w.rose);
+  spot.position.set(L.sunX, mix(w.height), -34);
+  roseDisc.material.color.copy(spot.color).multiplyScalar(L.glass);
+  hemi.intensity = L.ambient * mix(w.ambient);
+  volUniforms.uSpotI.value = spot.intensity;
+  sunSky = mix(w.day);
+  sunCandle = mix(w.candle);
+}
+let sunSky = 1, sunCandle = 1;
+
+// restore, then hand everything to the scene in one pass
+const restored = loadSettings();
+VOL_SCALE = cfg.vol.scale;
+REFL_SCALE = cfg.wave.reflScale;
+setWaterLevel(cfg.wave.level);
+applyShadowMap();
+applySize();
+applyAll();
+setMode(cfg.camera.mode === 'free' ? 'free' : 'cinematic');
+guiRefresh();
+storeReady = true;                      // only now may writes go to storage
+gui.onChange(saveSoon);                 // every controller, one hook
+
+// handles for the console, if you want to poke at it
+window.NAVIS = { THREE, scene, renderer, camera, spot, proj, PATH, water, cfg, gui, fly, reflRT, audio,
+                 frame: (dt) => frame(dt ?? 0.016), seek: (u) => { tPath = u; },
+                 applyPreset, applyLook, applyAll, guiRefresh, resetSettings, restored,
+                 togglePhoto, shoot, setSun: (v) => { sunT = v; }, bats };
+
+function tick() {
+  requestAnimationFrame(tick);
+  frame(Math.min(clock.getDelta(), 0.05));
+}
+
+function frame(dt) {
+  uTime.value += paused ? 0 : dt;
+  driveCamera(dt);
+  if (!proj.uSpotShadow.value && spot.shadow.map)
+    proj.uSpotShadow.value = spot.shadow.map.texture;
+
+  driveSun(dt);
+  if (cfg.light.sway && !cfg.sun.cycle) {      // slow drift of the low sun
+    spot.position.x = Math.sin(uTime.value * 0.045) * 7.0;
+    spot.position.y = 17 + Math.sin(uTime.value * 0.031) * 2.4;
+  }
+
+  // underwater switch, 0.3 m crossfade
+  const under = cfg.wave.on
+    ? THREE.MathUtils.smoothstep(water.position.y - camera.position.y, -0.15, 0.15) : 0;
+  scene.fog.density = 0.055 * under;
+  compositePass.uniforms.uUnder.value = under;
+  waterUniforms.uCam.value.copy(camera.position);
+  waterUniforms.uUnder.value = under > 0.5 ? 1 : 0;
+  updateLife(dt, uTime.value);
+  updateWake(dt, uTime.value);
+  audio.update(under);
+
+  if (cfg.wave.on && cfg.wave.reflect) renderReflection();
+
+  // 1 — everything except the water
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+
+  // 2 — set that aside as colour + linear depth
+  waterUniforms.uRefract.value = refractRT.texture;
+  waterUniforms.uRes.value.set(dbs.x, dbs.y);
+  waterUniforms.uFar.value = camera.far;
+  copyMat.uniforms.uNear.value = camera.near;
+  copyMat.uniforms.uFar.value = camera.far;
+  renderer.setRenderTarget(refractRT);
+  renderer.render(copyScene, volCam);
+
+  // 3 — the water on top, keeping the depth already in sceneRT
+  if (cfg.wave.on) {
+    camera.layers.set(WATER_LAYER);
+    renderer.autoClear = false;
+    renderer.setRenderTarget(sceneRT);
+    renderer.render(scene, camera);
+    renderer.autoClear = true;
+    camera.layers.set(RENDER_LAYER);
+  }
+  renderer.setRenderTarget(null);
+
+  if (volPassOn) renderVolumetrics();
+  compositePass.uniforms.uVolOn.value = volPassOn ? 1 : 0;
+  compositePass.uniforms.uTexel.value.set(1 / dbs.x, 1 / dbs.y);
+  composer.render();
+  stats.update();
+
+}
+const boot = document.getElementById('boot');
+boot.style.opacity = 0;
+setTimeout(() => boot.remove(), 900);
+tick();
+</script>
+</body>
+</html>
