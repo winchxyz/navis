@@ -32,8 +32,16 @@ nave, and build the vault out of Coons patches.
 Click once anywhere to start the audio; browsers will not begin it without a gesture.
 
 Every number that shapes the image is in the panel — six art-directed *looks*, four
-quality tiers, and about seventy individual controls. Settings persist in
-`localStorage`.
+quality tiers, and about seventy individual controls.
+
+Settings persist in `localStorage`, but only the values that **differ from the
+defaults**. Storing the whole config, which is the obvious thing to do, has a
+consequence that is invisible while you build and obvious the moment you ship: a
+returning visitor's blob pins every value to whatever it happened to be on their
+first load, so no default you change afterwards can ever reach them. Someone who had
+opened this page once kept nine hundred raindrops no matter what was deployed.
+Storing the diff keeps a deliberate choice and lets everything untouched follow the
+build.
 
 ---
 
@@ -95,6 +103,23 @@ One detail that took a while to see: with the eye exactly on the waterline, a cr
 two centimetres high swamps the frame and smears the grazing reflection across it.
 The surface is flattened in a small disc around the camera, and only while it is in
 that band.
+
+On top of the four waves, a twenty-slot buffer of impact rings — every drip, every
+raindrop, every splash and the wake behind you when you wade. A ring spreads its
+energy around a circumference that grows with the radius, so its amplitude falls as
+`1/sqrt(r)`; the viscous loss on top of that is slow. Decaying it exponentially in
+*time* instead made a ring die roughly where it landed, and cutting it off at a fixed
+age killed it outright while it still had 5% of its height, which snapped. Measured
+across a ring's life it now goes 33, 28, 22, 22, 20, 12, 4, 0 mm and reaches about
+seven metres. A drop also leaves a train rather than a single crest, and the train
+broadens as the long components outrun the short ones.
+
+The subtler half of that bug was not in the maths at all. Twelve slots at twenty
+impacts a second is a slot reused every 0.6 s, so most rings were overwritten long
+before they faded — and counting the impacts showed the bulk of them were the
+camera's own wake, firing every 0.14 s at a strength you could not see whenever the
+scripted path drifted near the surface. Wake now needs real wading speed, and six
+impacts a second share twenty slots.
 
 ### 4. Caustics: an animated texture, tinted by the projection
 
@@ -170,17 +195,21 @@ A drop is *not* a falling pitch — that is a laser. What you hear is the bubble
 behind by the impact, and as it shrinks its resonance goes **up**.
 
 **Life.** Sixty-four floating votive candles, nine drifting oak pews and nine bats,
-all solving the same wave equation as the surface. Forty-eight slow drips off the
-vault, a handful of drops through the breach, a burst of spray when you break the
-surface, and a wake behind you when you wade — everything feeds the same twelve-slot
-ripple buffer that the Gerstner shader reads.
+all solving the same wave equation as the surface. Twenty-six slow drips off the
+vault, five drops through the breach, a burst of spray when you break the surface,
+and a wake behind you when you wade — everything feeds the same ring buffer the
+Gerstner shader reads.
 
 The two kinds of falling water needed opposite corrections and it took being told
 twice to see why. The breach rain is confined to a column under three metres wide, so
 a count that sounds small still reads as a downpour; the vault drips are spread over
-forty-five metres of nave, so the same count reads as nothing at all. They are now
-five and forty-eight, and the drip sprite is twice the size of a raindrop rather than
-a third of it.
+forty-five metres of nave, so the same count reads as nothing at all. The drip sprite
+is also twice the size of a raindrop now rather than a third of it.
+
+Whether an impact rings the water used to be `i & 31`, which is a sensible way to
+keep nine hundred raindrops from swamping the buffer and a nonsensical one at five —
+exactly one of the five could ever make a ring, so the water under the breach was
+glass. Any constant tuned against a count has to be re-read when the count changes.
 
 **The day.** Dusk → noon → dusk in ninety seconds, on a sine, so one loop of the
 camera is one loop of the light and the seam never shows. It drives six parameters
