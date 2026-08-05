@@ -1435,7 +1435,7 @@ const waterUniforms = {
   uWave:       { value: new THREE.Vector4(1.0, 1.0, 1.0, 0.16) }, // amp, steep, speed, detail
   uAbsorb:     { value: 0.040 },
   // ring buffer of drip impacts: xz = where, z = when, w = strength
-  uRipples:    { value: Array.from({ length: 12 }, () => new THREE.Vector4(0, 0, -99, 0)) },
+  uRipples:    { value: Array.from({ length: 20 }, () => new THREE.Vector4(0, 0, -99, 0)) },
   // rgb = the scene behind the water, a = its linear depth over far
   uRefract:    { value: null },
   uRes:        { value: new THREE.Vector2(1, 1) },
@@ -1451,7 +1451,9 @@ const waterMat = new THREE.ShaderMaterial({
     uniform mat4  uReflMat;
     uniform vec4  uWave;
     uniform vec3  uCam;
-    uniform vec4  uRipples[12];
+    uniform vec4  uRipples[20];
+    #define RIPPLES 20
+    #define RING_LIFE 4.4
     varying vec3 vW;
     varying vec3 vN;
     varying vec4 vReflUV;
@@ -1493,21 +1495,33 @@ const waterMat = new THREE.ShaderMaterial({
       disp *= taper;
       acc  *= taper;
 
-      // drip impacts: an outgoing ring, decaying in age and in radius
-      for (int i = 0; i < 12; i++) {
+      /* Drip impacts. A ring on water does not decay exponentially in
+         time — its energy is spread around a circumference that grows
+         with the radius, so the amplitude falls as 1/sqrt(r), and the
+         viscous loss on top of that is slow. Decaying in age instead
+         made a ring die where it stood; worse, the old cutoff killed it
+         outright at 3.4 s while it still had 5% of its height left,
+         which is the snap you could see.
+         A drop also leaves a train rather than one crest, and the train
+         broadens as the components disperse: the long waves outrun the
+         short ones, so the packet stretches and the wavelength behind
+         the front grows with age.                                   */
+      for (int i = 0; i < RIPPLES; i++) {
         vec4 rp = uRipples[i];
         float age = uTime - rp.z;
-        if (age < 0.0 || age > 3.4 || rp.w <= 0.0) continue;
+        if (rp.w <= 0.0 || age < 0.0 || age > RING_LIFE) continue;
         vec2  d2 = wp0.xz - rp.xy;
         float d  = length(d2);
-        float front = age * 1.35;                    // ring radius
-        /* Reach mattered more than height. At exp(-d * 0.30) a ring was
-           gone within three metres of where it landed, so from anywhere
-           down the nave a drip made no visible mark at all.         */
-        float env = exp(-abs(d - front) * 3.0) * exp(-age * 0.85) * exp(-d * 0.14);
-        float phase = (d - front) * 13.0;
-        disp.y += rp.w * 0.075 * env * cos(phase);
-        vec2 g = (d > 1e-4 ? d2 / d : vec2(0.0)) * rp.w * 1.05 * env * sin(phase);
+        float x  = d - age * 1.55;                   // signed distance behind the front
+        float w  = 0.70 + age * 0.60;                // packet broadens as it disperses
+        float env = exp(-(x * x) / (w * w));
+        if (x < 0.0) env *= exp(-(x * x) * 4.0);     // steep leading edge
+        float amp = rp.w * 0.085 * inversesqrt(max(d, 0.4) + 1.0)
+                  * exp(-age * 0.13)                 // viscosity, gently
+                  * smoothstep(RING_LIFE, RING_LIFE * 0.55, age);
+        float k = 8.0 / (1.0 + age * 0.18);
+        disp.y += amp * env * cos(x * k);
+        vec2 g = (d > 1e-4 ? d2 / d : vec2(0.0)) * amp * env * k * sin(x * k) * 0.9;
         acc.x -= g.x;
         acc.z -= g.y;
       }
@@ -1969,7 +1983,7 @@ const candleLights = [0, 17, 38, 55].map(i => {
 });
 
 /* ── drips off the vault ───────────────────────────────────────────*/
-const DRIPS = 48;
+const DRIPS = 26;
 const dripPos = new Float32Array(DRIPS * 3);
 const dripGeo = new THREE.BufferGeometry();
 dripGeo.setAttribute('position', new THREE.BufferAttribute(dripPos, 3));
@@ -1990,7 +2004,7 @@ scene.add(drips);
 const dripState = Array.from({ length: DRIPS }, (_, i) => ({
   x: -6.2 + ((i * 3.1) % 12.4),
   z: Z0 + 3 + ((i * 5.7) % (Z1 - Z0 - 6)),
-  y: 0, v: 0, wait: (i * 0.83) % 4
+  y: 0, v: 0, wait: (i * 0.83) % 11
 }));
 /* ── vines through the breach ──────────────────────────────────────
    Where the roof opens, weather gets in and so does everything else.
@@ -2179,7 +2193,7 @@ function splash(x, y, z, power) {
     s.life = 0.55 + (k % 4) * 0.16;
     sprayHead++;
   }
-  const rp = waterUniforms.uRipples.value[rippleIdx++ % 12];
+  const rp = waterUniforms.uRipples.value[rippleIdx++ % 20];
   rp.set(x, z, uTime.value, Math.min(1.6, 0.7 + power * 0.5));
   audio.drip(x, z, Math.min(1.4, 0.5 + power * 0.4));
 }
@@ -2228,12 +2242,16 @@ function updateWake(dt, t) {
   const speed = Math.hypot(dx, dz) / Math.max(dt, 1e-4);
   wake.x = camera.position.x; wake.z = camera.position.z;
   wake.timer -= dt;
-  if (speed < 0.35 || wake.timer > 0) return;
-  wake.timer = 0.14;
-  const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+  /* Only when you are actually wading, and not often. At 0.35 m/s the
+     scripted camera's own drift qualified, and a ring every 0.14 s of
+     strength 0.04 filled the whole buffer with wake you cannot see —
+     evicting the drips, which is what made those vanish mid-ring.   */
+  if (speed < 0.9 || wake.timer > 0) return;
+  wake.timer = 0.45;
+  const r = waterUniforms.uRipples.value[rippleIdx++ % 20];
   // just behind the eye, and only as strong as the wading is fast
   r.set(camera.position.x - dx * 6, camera.position.z - dz * 6, t,
-        Math.min(0.85, speed * 0.16));
+        Math.min(0.9, 0.3 + speed * 0.16));
   // wading fast enough throws spray as well as rings
   if (speed > 3.2 && Math.abs(camera.position.y - wy) < 0.7)
     splash(camera.position.x - dx * 3, wy, camera.position.z - dz * 3, speed * 0.06);
@@ -2325,7 +2343,7 @@ function updateLife(dt, t) {
          silly at five — one of the five could ever make a ring, so the
          water under the breach was glass.                          */
       if (nR <= 48 || (i & 15) === 0) {
-        const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+        const r = waterUniforms.uRipples.value[rippleIdx++ % 20];
         r.set(d.x, d.z, t, 0.85);
       }
     }
@@ -2350,10 +2368,10 @@ function updateLife(dt, t) {
     d.y -= d.v * dt;
     const surf = wy + waveAt(d.x, d.z, wt, amp).y;
     if (d.y <= surf) {
-      const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
+      const r = waterUniforms.uRipples.value[rippleIdx++ % 20];
       r.set(d.x, d.z, t, 1.0);
       audio.drip(d.x, d.z, 1.0);
-      d.y = 0; d.v = 0; d.wait = 1.4 + (i * 0.37) % 3.6;
+      d.y = 0; d.v = 0; d.wait = 3.2 + (i * 0.37) % 9.0;
       dripPos[i * 3 + 1] = -999;
       continue;
     }
