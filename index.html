@@ -1234,7 +1234,12 @@ scene.add(sky, sky.target);
 const fillLights = [];
 for (let s = -1; s <= 1; s += 2) for (let k = 0; k < 2; k++) {
   const z = Z0 + (k * 2 + 1.6) * BAY;
-  const f = new THREE.SpotLight(0xffffff, 70, 0, 0.72, 0.6, ROSE_DECAY);
+  /* These keep inverse square. Flattening was right for the rose, which
+     is nine metres across, but an aisle lancet is 2.8 m and much closer
+     to a point — given decay 1 they stopped being fill and became
+     projectors, throwing saturated window patterns the length of the
+     arcade. Weak, local, and falling off fast is the whole job.     */
+  const f = new THREE.SpotLight(0xffffff, 190, 0, 0.72, 0.6, 2);
   f.map = aisleGlassTex;                 // the side lights are projected too
   f.position.set(s * (AISLE_X + 7), 9.5, z);
   f.target.position.set(s * -1, 3.5, z + 3);
@@ -1961,12 +1966,15 @@ const candleLights = [0, 17, 38, 55].map(i => {
 });
 
 /* ── drips off the vault ───────────────────────────────────────────*/
-const DRIPS = 22;
+const DRIPS = 48;
 const dripPos = new Float32Array(DRIPS * 3);
 const dripGeo = new THREE.BufferGeometry();
 dripGeo.setAttribute('position', new THREE.BufferAttribute(dripPos, 3));
 const drips = new THREE.Points(dripGeo, new THREE.PointsMaterial({
-  size: 0.085, map: radialSprite(32, [
+  // these are the drips that make the ripples, and they were three times
+  // smaller than a raindrop — spread over the whole nave that put them
+  // below the threshold of being noticed at all
+  size: 0.17, map: radialSprite(32, [
     [0.0, 'rgba(230,242,255,1)'], [0.45, 'rgba(180,210,235,0.55)'], [1.0, 'rgba(150,190,220,0)']
   ]),
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -1979,7 +1987,7 @@ scene.add(drips);
 const dripState = Array.from({ length: DRIPS }, (_, i) => ({
   x: -6.2 + ((i * 3.1) % 12.4),
   z: Z0 + 3 + ((i * 5.7) % (Z1 - Z0 - 6)),
-  y: 0, v: 0, wait: (i * 0.83) % 6
+  y: 0, v: 0, wait: (i * 0.83) % 4
 }));
 /* ── vines through the breach ──────────────────────────────────────
    Where the roof opens, weather gets in and so does everything else.
@@ -2111,7 +2119,7 @@ const rainTex = (() => {
   return t;
 })();
 const rain = new THREE.Points(rainGeo, new THREE.PointsMaterial({
-  size: 0.52, map: rainTex, transparent: true, depthWrite: false,
+  size: 0.34, map: rainTex, transparent: true, depthWrite: false,
   blending: THREE.AdditiveBlending, sizeAttenuation: true, fog: false
 }));
 rain.material.color.setScalar(1.15);
@@ -2339,7 +2347,7 @@ function updateLife(dt, t) {
       const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
       r.set(d.x, d.z, t, 1.0);
       audio.drip(d.x, d.z, 1.0);
-      d.y = 0; d.v = 0; d.wait = 2.5 + (i * 0.37) % 5.5;
+      d.y = 0; d.v = 0; d.wait = 1.4 + (i * 0.37) % 3.6;
       dripPos[i * 3 + 1] = -999;
       continue;
     }
@@ -2659,13 +2667,13 @@ const cfg = {
             bounds: true, walk: false, eye: 5.0, wake: true },
   photo:  { scale: 2.0 },
   light:  { rose: spot.intensity, angle: spot.angle, penumbra: spot.penumbra,
-            kelvin: 6500, glass: 2.2, fill: 70, ambient: 0.64, sway: false,
+            kelvin: 6500, glass: 2.2, fill: 190, ambient: 0.64, sway: false,
             sunX: 0, sunY: 17 },
   stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff', wetRough: 0.52 },
   life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
             pews: true, drips: true, dripRate: 1.0, bats: true },
   audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
-  rain:   { on: true, count: 70, speed: 1.0, daylight: 175, shaft: 9 },
+  rain:   { on: true, count: 26, speed: 1.0, daylight: 175, shaft: 9 },
   sun:    { cycle: true, length: 90 },
   vol:    { on: true, steps: 32, scale: 0.5, air: 0.020, water: 0.14,
             albedoAir: 0.85, albedoWater: 0.30, g: 0.65, gain: 0.34, sat: 1.8 },
@@ -2804,7 +2812,7 @@ const LOOKS = {
   // the brief: a low sun, dusty air, warm stone
   Vespers: {
     render: { exposure: 1.00, fog: '#0a2836', fogDensity: 0.055 },
-    light:  { kelvin: 6500, glass: 2.2, fill: 70, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
+    light:  { kelvin: 6500, glass: 2.2, fill: 190, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
     vol:    { gain: 0.34, air: 0.020, water: 0.14, g: 0.65, sat: 1.8 },
     wave:   { absorb: 0.040, deep: '#0a2836', amp: 1.0, detail: 0.16 },
     caust:  { gain: 2.2 },
@@ -2813,7 +2821,7 @@ const LOOKS = {
   // the last twenty minutes of light: sun almost on the horizon, thick air
   Ember: {
     render: { exposure: 1.12, fog: '#241a12', fogDensity: 0.050 },
-    light:  { kelvin: 3050, glass: 2.8, fill: 38, ambient: 0.30, sunX: -3.4, sunY: 12.5, angle: 0.40 },
+    light:  { kelvin: 3050, glass: 2.8, fill: 100, ambient: 0.30, sunX: -3.4, sunY: 12.5, angle: 0.40 },
     vol:    { gain: 0.62, air: 0.031, water: 0.17, g: 0.74, sat: 2.1 },
     wave:   { absorb: 0.080, deep: '#1d1409', amp: 0.75, detail: 0.13 },
     caust:  { gain: 2.9 },
@@ -2822,7 +2830,7 @@ const LOOKS = {
   // clear cold morning, clean water, the floor legible all the way down
   Aurora: {
     render: { exposure: 1.05, fog: '#07323e', fogDensity: 0.038 },
-    light:  { kelvin: 9200, glass: 2.0, fill: 112, ambient: 0.72, sunX: 2.6, sunY: 19.5, angle: 0.44 },
+    light:  { kelvin: 9200, glass: 2.0, fill: 300, ambient: 0.72, sunX: 2.6, sunY: 19.5, angle: 0.44 },
     vol:    { gain: 0.26, air: 0.015, water: 0.10, g: 0.58, sat: 1.6 },
     wave:   { absorb: 0.032, deep: '#06323e', amp: 1.25, detail: 0.22 },
     caust:  { gain: 3.4 },
@@ -2831,7 +2839,7 @@ const LOOKS = {
   // deep and quiet: almost no fill, heavy water, the rose the only thing alive
   Abyss: {
     render: { exposure: 0.78, fog: '#04161f', fogDensity: 0.090 },
-    light:  { kelvin: 5200, glass: 1.7, fill: 22, ambient: 0.20, sunX: 0, sunY: 20.5, angle: 0.38 },
+    light:  { kelvin: 5200, glass: 1.7, fill: 60, ambient: 0.20, sunX: 0, sunY: 20.5, angle: 0.38 },
     vol:    { gain: 0.24, air: 0.013, water: 0.27, g: 0.70, sat: 2.0 },
     wave:   { absorb: 0.115, deep: '#03131c', amp: 0.65, detail: 0.10 },
     caust:  { gain: 1.7 },
@@ -2840,16 +2848,16 @@ const LOOKS = {
   // mist off the water, the beams blown wide and pale
   Requiem: {
     render: { exposure: 0.96, fog: '#1b2430', fogDensity: 0.062 },
-    light:  { kelvin: 5900, glass: 2.5, fill: 95, ambient: 0.66, sunX: 0, sunY: 15.5, angle: 0.46 },
+    light:  { kelvin: 5900, glass: 2.5, fill: 250, ambient: 0.66, sunX: 0, sunY: 15.5, angle: 0.46 },
     vol:    { gain: 0.52, air: 0.036, water: 0.16, g: 0.55, sat: 1.25 },
     wave:   { absorb: 0.072, deep: '#1a232e', amp: 0.85, detail: 0.14 },
     caust:  { gain: 1.9 },
-    post:   { bloom: 0.95, radius: 0.86, threshold: 0.70 }
+    post:   { bloom: 0.68, radius: 0.82, threshold: 0.82 }
   },
   // high sun, crisp air, caustics doing the work instead of haze
   Meridian: {
     render: { exposure: 1.00, fog: '#0d3b47', fogDensity: 0.042 },
-    light:  { kelvin: 6800, glass: 1.9, fill: 144, ambient: 0.92, sunX: 0, sunY: 21, angle: 0.45 },
+    light:  { kelvin: 6800, glass: 1.9, fill: 380, ambient: 0.92, sunX: 0, sunY: 21, angle: 0.45 },
     vol:    { gain: 0.17, air: 0.010, water: 0.09, g: 0.60, sat: 1.5 },
     wave:   { absorb: 0.028, deep: '#0c3a46', amp: 1.4, detail: 0.26 },
     caust:  { gain: 3.8 },
@@ -2980,7 +2988,7 @@ gl.add(cfg.light, 'kelvin', 1800, 12000, 50).name('colour temp K').onChange(A);
 gl.add(cfg.light, 'angle', 0.15, 0.9, 0.005).name('cone angle').onChange(A);
 gl.add(cfg.light, 'penumbra', 0, 1, 0.01).onChange(A);
 gl.add(cfg.light, 'glass', 0, 10, 0.1).name('glass emission').onChange(A);
-gl.add(cfg.light, 'fill', 0, 400, 2).name('aisle fill').onChange(A);
+gl.add(cfg.light, 'fill', 0, 1200, 5).name('aisle fill').onChange(A);
 gl.add(cfg.light, 'ambient', 0, 2, 0.01).name('hemisphere').onChange(A);
 gl.add(cfg.light, 'sway').name('animate sun');
 gl.add(cfg.sun, 'cycle').name('day cycle');
