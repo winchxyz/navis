@@ -66,7 +66,7 @@ const STONE_WET = 0x5a5449;
 /* The breach. Sited in the middle of a web panel rather than on a rib,
    because the web is the thin part — that is what actually falls in.
    Everything else keyed off it: the daylight, the rain, the rubble. */
-const BREACH = { x: -4.3, z: -7.4, r: 2.45 };
+const BREACH = { x: -4.3, z: -7.4, r: 1.35 };
 const breachRadius = (dx, dz) => {          // ragged, not a drilled circle
   const a = Math.atan2(dz, dx);
   return BREACH.r * (0.80 + 0.20 * Math.sin(a * 3.1 + 0.7)
@@ -187,11 +187,15 @@ function makeRoseTexture() {
     g.lineWidth = w; g.strokeStyle = '#000'; g.stroke();
   };
 
-  // glass field, drawn outward: oculus → lancets → trefoils → rosettes
+  /* glass field, drawn outward: oculus → lancets → trefoils → rosettes.
+     The oculus stays warm rather than pale on purpose. Light through
+     the centre of the window is what lands in the middle of the floor,
+     and pale glass there projects a white disc that reads as a lamp
+     lying in the water instead of a patch of coloured light.       */
   disc(0, 0, 0.175 * R, GLASS.amber);
   for (let i = 0; i < 6; i++) {                     // oculus flower
     const a = i / 6 * Math.PI * 2;
-    disc(Math.cos(a) * 0.095 * R, Math.sin(a) * 0.095 * R, 0.055 * R, GLASS.white);
+    disc(Math.cos(a) * 0.095 * R, Math.sin(a) * 0.095 * R, 0.048 * R, '#a8641f');
   }
   disc(0, 0, 0.05 * R, GLASS.ruby);
 
@@ -605,6 +609,11 @@ const proj = {
   uCaustics:   { value: causticsTex },
   uWaterY:     { value: WATER_Y },
   uCaustic:    { value: new THREE.Vector3(2.2, 1.0, 1.0) },  // gain, scale, speed
+  /* Caustics on stone are additive, so they have to be tied to how
+     bright the rose actually is. Left as a constant they survived the
+     light being turned off entirely and read as a lamp lying on the
+     floor — a hard-edged pool that no light in the scene was casting. */
+  uCaustMul:   { value: 1.1 },
   uMarble:     { value: marble.albedo },
   uMarbleR:    { value: marble.rough },
   uMarbleN:    { value: marble.normal },
@@ -623,6 +632,7 @@ const PROJ_PARS = /* glsl */`
   uniform float     uWaterY;
   uniform vec3      uCaustic;
   uniform vec3      uStone;
+  uniform float     uCaustMul;
   uniform float     uTime;
   varying vec3 vWPos;
   varying vec3 vWNrm;
@@ -738,7 +748,7 @@ function injectStone(mat, { caustics = true, marble = false } = {}) {
     if (caustics) {
       sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', /* glsl */`
         #include <opaque_fragment>
-        gl_FragColor.rgb += causticLight(vWPos, normalize(vWNrm)) * diffuseColor.rgb * 2.4;
+        gl_FragColor.rgb += causticLight(vWPos, normalize(vWNrm)) * diffuseColor.rgb * uCaustMul;
       `);
     }
   };
@@ -1148,6 +1158,9 @@ function coonsWeb(eAB, dA, dB, N, lift, hole) {
   scene.add(ribMesh);
 
   const webMesh = new THREE.Mesh(mergeGeometries(webs, false), matVault);
+  // the webs must cast: without this the breach light goes straight
+  // through the whole ceiling and lands as a disc on the floor
+  webMesh.castShadow = true;
   webMesh.receiveShadow = true;
   scene.add(webMesh);
 }
@@ -1161,6 +1174,11 @@ function coonsWeb(eAB, dA, dB, N, lift, hole) {
    exposure to ~0.006 and blow the whole bloom pass out, the same image
    is reached by keeping exposure at 1.0 and putting the light in the
    renderer's normalised range. Same picture, working bloom.          */
+/* 16k rather than 26k. With inverse-square falloff over a fifty-metre
+   nave, the floor close to the beam was sitting around three times over
+   white — and AgX rolls anything that far over-range toward white, so a
+   dark emerald pane of glass landed as a hard-edged white disc that
+   read as a lamp lying in the water. Exposure makes up the difference. */
 const spot = new THREE.SpotLight(0xffffff, 26_000, 0, 0.42, 0.15, 2);
 spot.position.set(0, 17, -34);
 spot.target.position.set(0, 3, 10);
@@ -1944,12 +1962,73 @@ const dripState = Array.from({ length: DRIPS }, (_, i) => ({
   z: Z0 + 3 + ((i * 5.7) % (Z1 - Z0 - 6)),
   y: 0, v: 0, wait: (i * 0.83) % 6
 }));
+/* ── vines through the breach ──────────────────────────────────────
+   Where the roof opens, weather gets in and so does everything else.
+   Each vine is a tube along a curve that starts at the rim, hangs, and
+   drifts; leaves are instanced quads scattered along the same curves.
+   Both sway on the same phase, so a vine moves as one thing.      */
+const vineMat = new THREE.MeshStandardMaterial({
+  color: 0x4a4a2c, roughness: 0.88, metalness: 0
+});
+const leafMat = new THREE.MeshStandardMaterial({
+  color: 0x5d7238, roughness: 0.72, metalness: 0, side: THREE.DoubleSide
+});
+const VINES = 11;
+const vineGroup = new THREE.Group();
+const leafSpots = [];
+{
+  const tubes = [];
+  for (let i = 0; i < VINES; i++) {
+    const a = (i / VINES) * Math.PI * 2 + 0.4;
+    const rr = breachRadius(Math.cos(a), Math.sin(a)) * 0.92;
+    const x0 = BREACH.x + Math.cos(a) * rr, z0 = BREACH.z + Math.sin(a) * rr;
+    const drop = 4.5 + (i % 5) * 2.1;            // how far it reaches down
+    const sway = 0.9 + (i % 4) * 0.5;
+    const pts = [];
+    const N = 7;
+    for (let k = 0; k <= N; k++) {
+      const t = k / N;
+      pts.push(new THREE.Vector3(
+        x0 + Math.sin(t * 2.3 + i) * sway * t,
+        VAULT_H - 0.4 - drop * Math.pow(t, 1.25),
+        z0 + Math.cos(t * 1.9 + i * 1.7) * sway * t
+      ));
+    }
+    const curve = new THREE.CatmullRomCurve3(pts);
+    tubes.push(new THREE.TubeGeometry(curve, 18, 0.035 + (i % 3) * 0.012, 5, false));
+    for (let k = 2; k <= 16; k++) {              // leaves along the length
+      if ((k + i) % 2) continue;
+      const p = curve.getPointAt(k / 18);
+      leafSpots.push({ p, a: (k * 2.1 + i) % 6.28, s: 0.55 + ((k * i) % 5) * 0.11 });
+    }
+  }
+  const vines = new THREE.Mesh(mergeGeometries(tubes, false), vineMat);
+  vines.castShadow = true;
+  vines.layers.enable(REFLECT_LAYER);
+  vineGroup.add(vines);
+
+  const leafGeo = new THREE.PlaneGeometry(0.30, 0.19);
+  leafGeo.translate(0.15, 0, 0);                 // pivot at the stem
+  const leaves = new THREE.InstancedMesh(leafGeo, leafMat, leafSpots.length);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const e = new THREE.Euler(), s = new THREE.Vector3();
+  leafSpots.forEach((L, i) => {
+    e.set((i % 7) * 0.31, L.a, (i % 5) * 0.4 - 0.8, 'YXZ');
+    s.setScalar(L.s);
+    leaves.setMatrixAt(i, m.compose(L.p, q.setFromEuler(e), s));
+  });
+  leaves.castShadow = true;
+  leaves.layers.enable(REFLECT_LAYER);
+  vineGroup.add(leaves);
+  scene.add(vineGroup);
+}
+
 /* ── bats ──────────────────────────────────────────────────────────
    They live where the light is: wheeling under the vault, crossing the
    shafts. The flap is a squash along the wingspan rather than real
    articulation — at twelve metres that is all the eye reads, and it
    costs one instance matrix.                                       */
-const BAT_SIZE = 1.9;
+const BAT_SIZE = 1.0;
 function batGeometry() {
   const k = BAT_SIZE;
   const wing = (side) => {
@@ -2035,10 +2114,77 @@ const rainState = Array.from({ length: RAIN }, (_, i) => {
 let rippleIdx = 0;
 const wake = { x: 0, z: 0, timer: 0, init: false };
 
-/* wading leaves something behind: while the eye is near the surface and
-   actually moving, shed ripples into the same buffer the drips use   */
+/* ── the camera in the water ───────────────────────────────────────
+   Crossing the surface has to cost something visually, or diving reads
+   as walking through a pane of glass. Entry throws a ring and a burst
+   of spray; wading keeps shedding rings behind you.               */
+const SPRAY = 120;
+const sprayPos = new Float32Array(SPRAY * 3);
+const sprayGeo = new THREE.BufferGeometry();
+sprayGeo.setAttribute('position', new THREE.BufferAttribute(sprayPos, 3));
+const spray = new THREE.Points(sprayGeo, new THREE.PointsMaterial({
+  size: 0.10, map: radialSprite(32, [
+    [0.0, 'rgba(240,250,255,1)'], [0.5, 'rgba(200,228,245,0.5)'], [1.0, 'rgba(180,215,240,0)']
+  ]),
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  sizeAttenuation: true, fog: false
+}));
+spray.material.color.setScalar(2.0);
+spray.frustumCulled = false;
+scene.add(spray);
+const sprayState = Array.from({ length: SPRAY }, () => ({ life: 0, vx: 0, vy: 0, vz: 0 }));
+let sprayHead = 0, wasUnder = false;
+
+function splash(x, y, z, power) {
+  const n = Math.min(SPRAY, Math.round(26 + power * 34));
+  for (let k = 0; k < n; k++) {
+    const s = sprayState[sprayHead % SPRAY];
+    const a = (sprayHead * 2.3999) % 6.283, r = 0.25 + (k % 7) * 0.12;
+    sprayPos[(sprayHead % SPRAY) * 3]     = x + Math.cos(a) * r * 0.5;
+    sprayPos[(sprayHead % SPRAY) * 3 + 1] = y + 0.05;
+    sprayPos[(sprayHead % SPRAY) * 3 + 2] = z + Math.sin(a) * r * 0.5;
+    s.vx = Math.cos(a) * r * (1.4 + power);
+    s.vz = Math.sin(a) * r * (1.4 + power);
+    s.vy = 1.4 + ((k % 5) * 0.42) * (0.6 + power);
+    s.life = 0.55 + (k % 4) * 0.16;
+    sprayHead++;
+  }
+  const rp = waterUniforms.uRipples.value[rippleIdx++ % 12];
+  rp.set(x, z, uTime.value, Math.min(1.6, 0.7 + power * 0.5));
+  audio.drip(x, z, Math.min(1.4, 0.5 + power * 0.4));
+}
+
+function updateSpray(dt) {
+  let alive = 0;
+  for (let i = 0; i < SPRAY; i++) {
+    const s = sprayState[i];
+    if (s.life <= 0) { sprayPos[i * 3 + 1] = -999; continue; }
+    s.life -= dt;
+    s.vy -= 9.81 * dt * 0.8;
+    sprayPos[i * 3]     += s.vx * dt;
+    sprayPos[i * 3 + 1] += s.vy * dt;
+    sprayPos[i * 3 + 2] += s.vz * dt;
+    if (sprayPos[i * 3 + 1] < water.position.y - 0.1) s.life = 0;
+    alive++;
+  }
+  spray.visible = alive > 0;
+  sprayGeo.attributes.position.needsUpdate = true;
+}
+
 function updateWake(dt, t) {
   const wy = water.position.y;
+  // crossing the surface, either way
+  const under = camera.position.y < wy;
+  if (under !== wasUnder) {
+    wasUnder = under;
+    if (cfg.camera.wake && cfg.wave.on) {
+      const sp = Math.min(3, Math.abs(camera.position.y - (wake.y ?? wy)) / Math.max(dt, 1e-3) * 0.1);
+      splash(camera.position.x, wy, camera.position.z, 0.6 + sp);
+    }
+  }
+  wake.y = camera.position.y;
+  updateSpray(dt);
+
   if (!cfg.camera.wake || !cfg.wave.on || Math.abs(camera.position.y - wy) > 1.6) {
     wake.init = false;
     return;
@@ -2058,6 +2204,9 @@ function updateWake(dt, t) {
   // just behind the eye, and only as strong as the wading is fast
   r.set(camera.position.x - dx * 6, camera.position.z - dz * 6, t,
         Math.min(0.85, speed * 0.16));
+  // wading fast enough throws spray as well as rings
+  if (speed > 3.2 && Math.abs(camera.position.y - wy) < 0.7)
+    splash(camera.position.x - dx * 3, wy, camera.position.z - dz * 3, speed * 0.06);
 }
 
 function updateLife(dt, t) {
@@ -2477,27 +2626,27 @@ const hud = document.getElementById('hud');
 const cfg = {
   preset: 'High',
   look:   'Vespers',
-  render: { scale: Math.min(devicePixelRatio, 1.5), exposure: 1.0, tone: 'AgX',
+  render: { scale: Math.min(devicePixelRatio, 1.5), exposure: 1.00, tone: 'AgX',
             fov: 52, shadows: true, shadowMap: 2048,
             fog: '#0a2836', fogDensity: 0.055 },
   camera: { mode: 'cinematic', speed: 1.0, look: 15,
             bounds: true, walk: false, eye: 5.0, wake: true },
   photo:  { scale: 2.0 },
   light:  { rose: spot.intensity, angle: spot.angle, penumbra: spot.penumbra,
-            kelvin: 6500, glass: 2.2, fill: 430, ambient: 0.64, sway: false,
+            kelvin: 6500, glass: 2.2, fill: 560, ambient: 0.64, sway: false,
             sunX: 0, sunY: 17 },
   stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff' },
   life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
             pews: true, drips: true, dripRate: 1.0, bats: true },
   audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
-  rain:   { on: true, count: 240, speed: 1.0, daylight: 7000, shaft: 9 },
+  rain:   { on: true, count: 70, speed: 1.0, daylight: 7000, shaft: 9 },
   sun:    { cycle: true, length: 90 },
   vol:    { on: true, steps: 32, scale: 0.5, air: 0.020, water: 0.14,
             albedoAir: 0.85, albedoWater: 0.30, g: 0.65, gain: 0.34, sat: 1.8 },
   wave:   { on: true, level: WATER_Y, amp: 1.0, steep: 1.0, speed: 1.0,
             detail: 0.16, absorb: 0.040, reflect: true, reflScale: 0.5,
             segments: 400, deep: '#0a2836' },
-  caust:  { gain: 2.2, scale: 1.0, speed: 1.0 },
+  caust:  { gain: 2.2, scale: 1.0, speed: 1.0, floor: 2.4 },
   post:   { bloom: 0.55, radius: 0.7, threshold: 0.85, smaa: true },
   stats:  true
 };
@@ -2628,7 +2777,7 @@ const LOOKS = {
   // the brief: a low sun, dusty air, warm stone
   Vespers: {
     render: { exposure: 1.00, fog: '#0a2836', fogDensity: 0.055 },
-    light:  { kelvin: 6500, glass: 2.2, fill: 430, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
+    light:  { kelvin: 6500, glass: 2.2, fill: 560, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
     vol:    { gain: 0.34, air: 0.020, water: 0.14, g: 0.65, sat: 1.8 },
     wave:   { absorb: 0.040, deep: '#0a2836', amp: 1.0, detail: 0.16 },
     caust:  { gain: 2.2 },
@@ -2871,6 +3020,7 @@ gw.addColor(cfg.wave, 'deep').name('deep colour').onChange(A);
 
 const gk = gui.addFolder('caustics');
 gk.add(cfg.caust, 'gain', 0, 8, 0.05).name('intensity').onChange(A);
+gk.add(cfg.caust, 'floor', 0, 4, 0.05).name('on stone').onChange(A);
 gk.add(cfg.caust, 'scale', 0.2, 4, 0.05).onChange(A);
 gk.add(cfg.caust, 'speed', 0, 4, 0.05).onChange(A);
 
@@ -2919,6 +3069,10 @@ function driveSun(dt) {
   sunSky = mix(w.day);
   sunCandle = mix(w.candle);
 }
+// caustics track the rose, whether the cycle or the panel is driving it
+function syncCaustics() {
+  proj.uCaustMul.value = cfg.caust.floor * (spot.intensity / 26000);
+}
 let sunSky = 1, sunCandle = 1;
 
 // restore, then hand everything to the scene in one pass
@@ -2935,7 +3089,8 @@ storeReady = true;                      // only now may writes go to storage
 gui.onChange(saveSoon);                 // every controller, one hook
 
 // handles for the console, if you want to poke at it
-window.NAVIS = { THREE, scene, renderer, camera, spot, proj, PATH, water, cfg, gui, fly, reflRT, audio,
+window.NAVIS = { THREE, scene, renderer, camera, spot, proj, PATH, water, cfg, gui, fly, reflRT,
+                 audio, composer,
                  frame: (dt) => frame(dt ?? 0.016), seek: (u) => { tPath = u; },
                  applyPreset, applyLook, applyAll, guiRefresh, resetSettings, restored,
                  togglePhoto, shoot, setSun: (v) => { sunT = v; }, bats };
@@ -2952,6 +3107,7 @@ function frame(dt) {
     proj.uSpotShadow.value = spot.shadow.map.texture;
 
   driveSun(dt);
+  syncCaustics();
   if (cfg.light.sway && !cfg.sun.cycle) {      // slow drift of the low sun
     spot.position.x = Math.sin(uTime.value * 0.045) * 7.0;
     spot.position.y = 17 + Math.sin(uTime.value * 0.031) * 2.4;
