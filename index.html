@@ -614,6 +614,7 @@ const proj = {
      light being turned off entirely and read as a lamp lying on the
      floor — a hard-edged pool that no light in the scene was casting. */
   uCaustMul:   { value: 1.1 },
+  uWetRough:   { value: 0.52 },
   uMarble:     { value: marble.albedo },
   uMarbleR:    { value: marble.rough },
   uMarbleN:    { value: marble.normal },
@@ -633,6 +634,7 @@ const PROJ_PARS = /* glsl */`
   uniform vec3      uCaustic;
   uniform vec3      uStone;
   uniform float     uCaustMul;
+  uniform float     uWetRough;
   uniform float     uTime;
   varying vec3 vWPos;
   varying vec3 vWNrm;
@@ -743,7 +745,12 @@ function injectStone(mat, { caustics = true, marble = false } = {}) {
     sh.fragmentShader = sh.fragmentShader.replace('#include <roughnessmap_fragment>', /* glsl */`
       #include <roughnessmap_fragment>
       ${marble ? 'roughnessFactor *= triplanar(uMarbleR, vWPos, normalize(vWNrm), uStone.x).r * uStone.y;' : ''}
-      roughnessFactor = mix(roughnessFactor, 0.25, wet);
+      /* Submerged stone is smoother than dry stone, but at 0.25 the
+         floor was a mirror: the specular lobe of the rose collapsed
+         into a hard-edged disc some seventy times brighter than the
+         diffuse floor around it, which is what read as a lamp lying in
+         the water. The highlight is real — it just has to be spread. */
+      roughnessFactor = mix(roughnessFactor, uWetRough, wet);
     `);
     if (caustics) {
       sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>', /* glsl */`
@@ -2645,7 +2652,7 @@ const cfg = {
   light:  { rose: spot.intensity, angle: spot.angle, penumbra: spot.penumbra,
             kelvin: 6500, glass: 2.2, fill: 70, ambient: 0.64, sway: false,
             sunX: 0, sunY: 17 },
-  stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff' },
+  stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff', wetRough: 0.52 },
   life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
             pews: true, drips: true, dripRate: 1.0, bats: true },
   audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
@@ -2721,6 +2728,7 @@ const applyAll = () => {
 
   const st = cfg.stone;
   proj.uStone.value.set(st.scale, st.rough, st.relief);
+  proj.uWetRough.value = st.wetRough;
   matStone.color.set(st.tint);
   matFloor.normalScale.set(st.relief * 0.6, st.relief * 0.6);
 
@@ -2999,6 +3007,7 @@ const gs = gui.addFolder('marble');
 gs.add(cfg.stone, 'scale', 0.05, 1.2, 0.005).name('vein scale').onChange(A);
 gs.add(cfg.stone, 'rough', 0.2, 2, 0.02).name('roughness ×').onChange(A);
 gs.add(cfg.stone, 'relief', 0, 2, 0.02).name('relief').onChange(A);
+gs.add(cfg.stone, 'wetRough', 0.05, 1, 0.01).name('submerged gloss').onChange(A);
 gs.addColor(cfg.stone, 'tint').name('tint').onChange(A);
 
 const gv = gui.addFolder('volumetric shafts');
