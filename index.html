@@ -1174,12 +1174,18 @@ function coonsWeb(eAB, dA, dB, N, lift, hole) {
    exposure to ~0.006 and blow the whole bloom pass out, the same image
    is reached by keeping exposure at 1.0 and putting the light in the
    renderer's normalised range. Same picture, working bloom.          */
-/* 16k rather than 26k. With inverse-square falloff over a fifty-metre
-   nave, the floor close to the beam was sitting around three times over
-   white — and AgX rolls anything that far over-range toward white, so a
-   dark emerald pane of glass landed as a hard-edged white disc that
-   read as a lamp lying in the water. Exposure makes up the difference. */
-const spot = new THREE.SpotLight(0xffffff, 26_000, 0, 0.42, 0.15, 2);
+/* Decay 1, not 2. A rose window is nine metres across — it is an area
+   source, and inverse-square is the falloff of a point. Over a fifty
+   metre nave the difference is not subtle: at decay 2 the floor twenty
+   metres from the beam took four times what the far end did, so a
+   single pane of dark glass landed near the camera at three times over
+   white. AgX rolls anything that far over-range toward white, which is
+   why it read as a lamp lying in the water rather than as coloured
+   light. At decay 1 that ratio halves, the far end gains, and the
+   intensity number drops accordingly — it is no longer candela and is
+   not pretending to be.                                            */
+const ROSE_DECAY = 1.0;
+const spot = new THREE.SpotLight(0xffffff, 650, 0, 0.42, 0.15, ROSE_DECAY);
 spot.position.set(0, 17, -34);
 spot.target.position.set(0, 3, 10);
 spot.map = roseTex;
@@ -1199,7 +1205,8 @@ hemi.layers.enable(REFLECT_LAYER);
 /* Daylight through the breach. A narrow cone straight down, casting
    shadows — the torn edge of the web is what shapes the beam, so the
    shaft arrives with the same ragged outline as the hole itself.   */
-const sky = new THREE.SpotLight(0xd7e4ff, 11000, 0, 0.12, 0.35, 2);
+// daylight from outside is as close to parallel as anything here gets
+const sky = new THREE.SpotLight(0xd7e4ff, 175, 0, 0.12, 0.35, ROSE_DECAY);
 sky.position.set(BREACH.x, 46, BREACH.z);
 sky.target.position.set(BREACH.x, 0, BREACH.z);
 sky.castShadow = true;
@@ -1215,7 +1222,7 @@ scene.add(sky, sky.target);
 const fillLights = [];
 for (let s = -1; s <= 1; s += 2) for (let k = 0; k < 2; k++) {
   const z = Z0 + (k * 2 + 1.6) * BAY;
-  const f = new THREE.SpotLight(0xffffff, 620, 0, 0.72, 0.6, 2);
+  const f = new THREE.SpotLight(0xffffff, 70, 0, 0.72, 0.6, ROSE_DECAY);
   f.map = aisleGlassTex;                 // the side lights are projected too
   f.position.set(s * (AISLE_X + 7), 9.5, z);
   f.target.position.set(s * -1, 3.5, z + 3);
@@ -2407,6 +2414,7 @@ const volUniforms = {
   uSkyCone:    { value: new THREE.Vector2() },
   uSkyI:       { value: 0 },
   uSkyG:       { value: 0.12 },
+  uDecay:      { value: ROSE_DECAY },
   uSkyMat:     { value: sky.shadow.matrix },
   uSkyShadow:  { value: null }
 };
@@ -2425,7 +2433,7 @@ const volMat = new THREE.RawShaderMaterial({
     uniform mat4 uSpotMat, uInvProj, uCamW, uSkyMat;
     uniform vec3 uCamPos, uSpotPos, uSpotDir, uSkyPos, uSkyDir, uSkyCol;
     uniform vec2 uCone, uDens, uScat, uSkyCone;
-    uniform float uSpotI, uNear, uFar, uWaterY, uGain, uHG, uSkyI, uSkyG;
+    uniform float uSpotI, uNear, uFar, uWaterY, uGain, uHG, uSkyI, uSkyG, uDecay;
     uniform int uSteps;
 
     const float PI = 3.141592653589793;
@@ -2489,7 +2497,9 @@ const volMat = new THREE.RawShaderMaterial({
         L /= dl;
         float att = smoothstep(uCone.x, uCone.y, dot(-L, uSpotDir));
         if (att > 0.0) {
-          vec3 lc = roseAt(p) * (uSpotI / (dl * dl)) * att;
+          // same falloff the surfaces get, or the shafts drift away
+          // from the light they are supposed to belong to
+          vec3 lc = roseAt(p) * (uSpotI / max(pow(dl, uDecay), 0.01)) * att;
           acc += trans * lc * hg(dot(dirW, -L)) * dens * scat * dt;
         }
 
@@ -2511,7 +2521,7 @@ const volMat = new THREE.RawShaderMaterial({
                where a forward-peaked phase gives almost nothing. Dust in
                a real light column scatters far more evenly than that, so
                this light gets its own, nearly isotropic phase.       */
-            vec3 lc2 = uSkyCol * (uSkyI / (dl2 * dl2)) * att2 * vis2;
+            vec3 lc2 = uSkyCol * (uSkyI / max(pow(dl2, uDecay), 0.01)) * att2 * vis2;
             acc += trans * lc2 * hgG(dot(dirW, -L2), uSkyG) * dens * scat * dt;
           }
         }
@@ -2633,13 +2643,13 @@ const cfg = {
             bounds: true, walk: false, eye: 5.0, wake: true },
   photo:  { scale: 2.0 },
   light:  { rose: spot.intensity, angle: spot.angle, penumbra: spot.penumbra,
-            kelvin: 6500, glass: 2.2, fill: 560, ambient: 0.64, sway: false,
+            kelvin: 6500, glass: 2.2, fill: 70, ambient: 0.64, sway: false,
             sunX: 0, sunY: 17 },
   stone:  { scale: 0.18, rough: 1.0, relief: 0.35, tint: '#ffffff' },
   life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
             pews: true, drips: true, dripRate: 1.0, bats: true },
   audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
-  rain:   { on: true, count: 70, speed: 1.0, daylight: 7000, shaft: 9 },
+  rain:   { on: true, count: 70, speed: 1.0, daylight: 175, shaft: 9 },
   sun:    { cycle: true, length: 90 },
   vol:    { on: true, steps: 32, scale: 0.5, air: 0.020, water: 0.14,
             albedoAir: 0.85, albedoWater: 0.30, g: 0.65, gain: 0.34, sat: 1.8 },
@@ -2777,7 +2787,7 @@ const LOOKS = {
   // the brief: a low sun, dusty air, warm stone
   Vespers: {
     render: { exposure: 1.00, fog: '#0a2836', fogDensity: 0.055 },
-    light:  { kelvin: 6500, glass: 2.2, fill: 560, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
+    light:  { kelvin: 6500, glass: 2.2, fill: 70, ambient: 0.64, sunX: 0, sunY: 17, angle: 0.42 },
     vol:    { gain: 0.34, air: 0.020, water: 0.14, g: 0.65, sat: 1.8 },
     wave:   { absorb: 0.040, deep: '#0a2836', amp: 1.0, detail: 0.16 },
     caust:  { gain: 2.2 },
@@ -2786,7 +2796,7 @@ const LOOKS = {
   // the last twenty minutes of light: sun almost on the horizon, thick air
   Ember: {
     render: { exposure: 1.12, fog: '#241a12', fogDensity: 0.050 },
-    light:  { kelvin: 3050, glass: 2.8, fill: 300, ambient: 0.30, sunX: -3.4, sunY: 12.5, angle: 0.40 },
+    light:  { kelvin: 3050, glass: 2.8, fill: 38, ambient: 0.30, sunX: -3.4, sunY: 12.5, angle: 0.40 },
     vol:    { gain: 0.62, air: 0.031, water: 0.17, g: 0.74, sat: 2.1 },
     wave:   { absorb: 0.080, deep: '#1d1409', amp: 0.75, detail: 0.13 },
     caust:  { gain: 2.9 },
@@ -2795,7 +2805,7 @@ const LOOKS = {
   // clear cold morning, clean water, the floor legible all the way down
   Aurora: {
     render: { exposure: 1.05, fog: '#07323e', fogDensity: 0.038 },
-    light:  { kelvin: 9200, glass: 2.0, fill: 900, ambient: 0.72, sunX: 2.6, sunY: 19.5, angle: 0.44 },
+    light:  { kelvin: 9200, glass: 2.0, fill: 112, ambient: 0.72, sunX: 2.6, sunY: 19.5, angle: 0.44 },
     vol:    { gain: 0.26, air: 0.015, water: 0.10, g: 0.58, sat: 1.6 },
     wave:   { absorb: 0.032, deep: '#06323e', amp: 1.25, detail: 0.22 },
     caust:  { gain: 3.4 },
@@ -2804,7 +2814,7 @@ const LOOKS = {
   // deep and quiet: almost no fill, heavy water, the rose the only thing alive
   Abyss: {
     render: { exposure: 0.78, fog: '#04161f', fogDensity: 0.090 },
-    light:  { kelvin: 5200, glass: 1.7, fill: 180, ambient: 0.20, sunX: 0, sunY: 20.5, angle: 0.38 },
+    light:  { kelvin: 5200, glass: 1.7, fill: 22, ambient: 0.20, sunX: 0, sunY: 20.5, angle: 0.38 },
     vol:    { gain: 0.24, air: 0.013, water: 0.27, g: 0.70, sat: 2.0 },
     wave:   { absorb: 0.115, deep: '#03131c', amp: 0.65, detail: 0.10 },
     caust:  { gain: 1.7 },
@@ -2813,7 +2823,7 @@ const LOOKS = {
   // mist off the water, the beams blown wide and pale
   Requiem: {
     render: { exposure: 0.96, fog: '#1b2430', fogDensity: 0.062 },
-    light:  { kelvin: 5900, glass: 2.5, fill: 760, ambient: 0.66, sunX: 0, sunY: 15.5, angle: 0.46 },
+    light:  { kelvin: 5900, glass: 2.5, fill: 95, ambient: 0.66, sunX: 0, sunY: 15.5, angle: 0.46 },
     vol:    { gain: 0.52, air: 0.036, water: 0.16, g: 0.55, sat: 1.25 },
     wave:   { absorb: 0.072, deep: '#1a232e', amp: 0.85, detail: 0.14 },
     caust:  { gain: 1.9 },
@@ -2822,7 +2832,7 @@ const LOOKS = {
   // high sun, crisp air, caustics doing the work instead of haze
   Meridian: {
     render: { exposure: 1.00, fog: '#0d3b47', fogDensity: 0.042 },
-    light:  { kelvin: 6800, glass: 1.9, fill: 1150, ambient: 0.92, sunX: 0, sunY: 21, angle: 0.45 },
+    light:  { kelvin: 6800, glass: 1.9, fill: 144, ambient: 0.92, sunX: 0, sunY: 21, angle: 0.45 },
     vol:    { gain: 0.17, air: 0.010, water: 0.09, g: 0.60, sat: 1.5 },
     wave:   { absorb: 0.028, deep: '#0c3a46', amp: 1.4, detail: 0.26 },
     caust:  { gain: 3.8 },
@@ -2948,12 +2958,12 @@ gph.add({ enter: () => togglePhoto(true) }, 'enter').name('enter  (P)');
 gph.add({ save: () => shoot() }, 'save').name('save PNG  (Enter)');
 
 const gl = gui.addFolder('light');
-gl.add(cfg.light, 'rose', 0, 120000, 100).name('rose intensity').onChange(A);
+gl.add(cfg.light, 'rose', 0, 3000, 5).name('rose intensity').onChange(A);
 gl.add(cfg.light, 'kelvin', 1800, 12000, 50).name('colour temp K').onChange(A);
 gl.add(cfg.light, 'angle', 0.15, 0.9, 0.005).name('cone angle').onChange(A);
 gl.add(cfg.light, 'penumbra', 0, 1, 0.01).onChange(A);
 gl.add(cfg.light, 'glass', 0, 10, 0.1).name('glass emission').onChange(A);
-gl.add(cfg.light, 'fill', 0, 4000, 20).name('aisle fill').onChange(A);
+gl.add(cfg.light, 'fill', 0, 400, 2).name('aisle fill').onChange(A);
 gl.add(cfg.light, 'ambient', 0, 2, 0.01).name('hemisphere').onChange(A);
 gl.add(cfg.light, 'sway').name('animate sun');
 gl.add(cfg.sun, 'cycle').name('day cycle');
@@ -2982,7 +2992,7 @@ const gB = gui.addFolder('breach & rain');
 gB.add(cfg.rain, 'on').name('rain');
 gB.add(cfg.rain, 'count', 0, 900, 10).name('drops');
 gB.add(cfg.rain, 'speed', 0.2, 3, 0.05).name('fall speed');
-gB.add(cfg.rain, 'daylight', 0, 40000, 250).name('daylight');
+gB.add(cfg.rain, 'daylight', 0, 1200, 5).name('daylight');
 gB.add(cfg.rain, 'shaft', 0, 60, 0.5).name('shaft density');
 
 const gs = gui.addFolder('marble');
@@ -3071,7 +3081,7 @@ function driveSun(dt) {
 }
 // caustics track the rose, whether the cycle or the panel is driving it
 function syncCaustics() {
-  proj.uCaustMul.value = cfg.caust.floor * (spot.intensity / 26000);
+  proj.uCaustMul.value = cfg.caust.floor * (spot.intensity / 650);
 }
 let sunSky = 1, sunCandle = 1;
 
@@ -3090,7 +3100,7 @@ gui.onChange(saveSoon);                 // every controller, one hook
 
 // handles for the console, if you want to poke at it
 window.NAVIS = { THREE, scene, renderer, camera, spot, proj, PATH, water, cfg, gui, fly, reflRT,
-                 audio, composer,
+                 audio, composer, sceneRT, refractRT,
                  frame: (dt) => frame(dt ?? 0.016), seek: (u) => { tPath = u; },
                  applyPreset, applyLook, applyAll, guiRefresh, resetSettings, restored,
                  togglePhoto, shoot, setSun: (v) => { sunT = v; }, bats };
