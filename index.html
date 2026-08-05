@@ -1150,13 +1150,18 @@ function coonsWeb(eAB, dA, dB, N, lift, hole) {
   /* An overcast sky, hung above the roof. Without it the hole reads as
      a black patch rather than an opening — you need to see what the
      light is coming from.                                          */
+  /* Small, and close above the hole. At sixteen metres across and nine
+     metres up it hung over the whole building, and looking up anywhere
+     near the clerestory you saw it past the edge of the vault — a pale
+     shape the size of a bay that read as a second, enormous hole in the
+     roof. It only ever needs to be visible through the breach.     */
   const skyDisc = new THREE.Mesh(
-    new THREE.CircleGeometry(16, 40),
+    new THREE.CircleGeometry(3.2, 32),
     new THREE.MeshBasicMaterial({ color: 0x9fb6d8, toneMapped: true, fog: false })
   );
   skyDisc.material.color.multiplyScalar(0.95);
   skyDisc.rotation.x = Math.PI / 2;            // facing down into the nave
-  skyDisc.position.set(BREACH.x, 30, BREACH.z);
+  skyDisc.position.set(BREACH.x, 23.5, BREACH.z);
   skyDisc.layers.enable(REFLECT_LAYER);
   scene.add(skyDisc);
 
@@ -2630,6 +2635,10 @@ onResize = () => {
   refractRT.setSize(dbs.x, dbs.y);
   waterUniforms.uRes.value.set(dbs.x, dbs.y);
   volRT.setSize(Math.ceil(dbs.x * VOL_SCALE), Math.ceil(dbs.y * VOL_SCALE));
+  // the composer caches the pixel ratio it was built with, so raising
+  // the render scale never reached the post chain — photo mode was
+  // hiding the UI and changing nothing else
+  composer.setPixelRatio(renderer.getPixelRatio());
   composer.setSize(innerWidth, innerHeight);
   bloom.setSize(dbs.x, dbs.y);
   sizeReflect();
