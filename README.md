@@ -46,14 +46,25 @@ geometry — it is drawn once to a 2048² canvas with twelvefold symmetry and hu
 `SpotLight.map`.
 
 ```js
-const spot = new THREE.SpotLight(0xffffff, 26000, 0, 0.42, 0.15, 2);
+const spot = new THREE.SpotLight(0xffffff, 650, 0, 0.42, 0.15, 1.0);
 spot.map = roseTexture;
 spot.castShadow = true;
 ```
 
 That one object gives you three subsystems for free: coloured patches on the columns,
 a coloured source to tint the caustics, and a coloured source for the volumetric
-shafts. The side lancets work the same way, twenty times weaker.
+shafts. The side lancets work the same way, much weaker.
+
+Note the decay of **1**, not 2. A rose window is nine metres across — it is an area
+source, and inverse square is the falloff of a *point*. Over a fifty-metre nave the
+difference is not subtle: measured on the floor, the ratio between twenty metres from
+the beam and the far end went from 28× to 2.7× when it was flattened.
+
+The aisle lancets keep inverse square, because 2.8 m is much closer to a point. Giving
+them decay 1 too was a mistake that took a while to see: they stopped being fill and
+became projectors, throwing saturated window patterns the length of the arcade. The
+vault stayed black, so it didn't look like an exposure problem — the stone was just
+covered in colour.
 
 ### 2. Water: a planar reflector plus screen-space refraction
 
@@ -139,6 +150,14 @@ over those curves, with the `v = 1` edge collapsed onto the keystone.
 part and that is what actually falls in. The hole radius is modulated by angle so the
 edge is torn, not drilled, and the breached bay is tessellated finer so the tear
 reads. The daylight through it casts shadows, so the ragged edge shapes the beam.
+Eleven vines have come down through it and hang into the nave, tubes along cubic
+curves with instanced leaves scattered on the same paths; both sway on one phase, so
+a vine moves as a single thing rather than as a stem and a cloud of leaves.
+
+The sky behind it is a 3.2 m disc sitting just above the opening. It used to be
+sixteen metres across and nine metres up, which meant it hung over the whole building
+— look up anywhere near the clerestory and you saw it past the edge of the vault, a
+pale shape the size of a bay that read as a second, enormous hole in the roof.
 
 **Sound.** A convolution reverb whose impulse response is generated: twenty discrete
 early reflections off the arcade, then a four-second stone tail. Water is a narrow,
@@ -151,9 +170,17 @@ A drop is *not* a falling pitch — that is a laser. What you hear is the bubble
 behind by the impact, and as it shrinks its resonance goes **up**.
 
 **Life.** Sixty-four floating votive candles, nine drifting oak pews and nine bats,
-all solving the same wave equation as the surface. Drips off the vault, rain through
-the breach, and a wake behind you when you wade — everything feeds the same
-twelve-slot ripple buffer that the Gerstner shader reads.
+all solving the same wave equation as the surface. Forty-eight slow drips off the
+vault, a handful of drops through the breach, a burst of spray when you break the
+surface, and a wake behind you when you wade — everything feeds the same twelve-slot
+ripple buffer that the Gerstner shader reads.
+
+The two kinds of falling water needed opposite corrections and it took being told
+twice to see why. The breach rain is confined to a column under three metres wide, so
+a count that sounds small still reads as a downpour; the vault drips are spread over
+forty-five metres of nave, so the same count reads as nothing at all. They are now
+five and forty-eight, and the drip sprite is twice the size of a raindrop rather than
+a third of it.
 
 **The day.** Dusk → noon → dusk in ninety seconds, on a sine, so one loop of the
 camera is one loop of the light and the seam never shows. It drives six parameters
@@ -177,15 +204,43 @@ Any static server — ES modules will not load over `file://`.
 npx serve .
 ```
 
+## One thing worth measuring for
+
+For most of this project I tuned lighting by looking at the picture, and it cost me
+several wrong diagnoses. A patch on the floor near the beam sat at over six times
+white while the floor a few metres away sat at 0.05 — a hundredfold step that read as
+a lamp lying in the water. I blamed the falloff, the caustics, the projected texture's
+sharpness and the marble in turn. Every one of them was wrong, and flattening the
+falloff moved it by 16%.
+
+What found it was reading the **linear scene radiance** out of the render target
+before tone mapping, isolating the rose into a buffer of its own, and bisecting the
+scene by visibility. The answer was that submerged stone was being mixed to roughness
+0.25, and at that gloss the GGX lobe collapses into a hard-edged specular disc. It was
+never illumination at all:
+
+| submerged roughness | 0.25 | 0.40 | 0.52 | 0.70 |
+|---|---|---|---|---|
+| patch radiance | 7.58 | 1.26 | **0.52** | 0.24 |
+
+It sits at 0.52 now, exposed as *submerged gloss* in the panel. If you fork this and
+find yourself adjusting exposure to fix a specific bright thing, measure the thing
+first — the fix is rarely where it looks.
+
 ## Notes on the numbers
 
-Lights are in three.js's normalised range rather than real candela. Bloom runs
-before tone mapping, so its 0.85 threshold only means anything if scene radiance sits
-near 1.0; the alternative was crushing exposure to ~0.006 and blowing the bloom pass
-out entirely. Same picture, working bloom.
+Lights are in three.js's normalised range rather than real candela, and the window
+sources use decay 1, so their intensities are not comparable to anything physical.
+Bloom runs before tone mapping, so its 0.85 threshold only means anything if scene
+radiance sits near 1.0; the alternative was crushing exposure to ~0.006 and blowing
+the bloom pass out entirely. Same picture, working bloom.
 
 Tone mapping is AgX, applied in `OutputPass`. The chain is exactly: volumetric
 composite → bloom → AgX → SMAA. No grain, no chromatic aberration, no vignette.
+
+Photo mode really does render at 2× — `EffectComposer` caches the pixel ratio it was
+constructed with, so until `setPixelRatio` was called on resize the render-scale
+setting never reached the post chain and the mode only hid the UI.
 
 ## Licence
 

@@ -2673,7 +2673,7 @@ const cfg = {
   life:   { candles: true, count: 64, candleGlow: 2.4, candleLights: true,
             pews: true, drips: true, dripRate: 1.0, bats: true },
   audio:  { on: true, master: 0.55, water: 0.040, drips: 1.0, reverb: 0.85 },
-  rain:   { on: true, count: 26, speed: 1.0, daylight: 175, shaft: 9 },
+  rain:   { on: true, count: 5, speed: 1.0, daylight: 175, shaft: 9 },
   sun:    { cycle: true, length: 90 },
   vol:    { on: true, steps: 32, scale: 0.5, air: 0.020, water: 0.14,
             albedoAir: 0.85, albedoWater: 0.30, g: 0.65, gain: 0.34, sat: 1.8 },
@@ -3015,7 +3015,7 @@ gL.add(cfg.life, 'dripRate', 0.1, 6, 0.1).name('drip rate');
 
 const gB = gui.addFolder('breach & rain');
 gB.add(cfg.rain, 'on').name('rain');
-gB.add(cfg.rain, 'count', 0, 900, 10).name('drops');
+gB.add(cfg.rain, 'count', 0, 200, 1).name('drops');
 gB.add(cfg.rain, 'speed', 0.2, 3, 0.05).name('fall speed');
 gB.add(cfg.rain, 'daylight', 0, 1200, 5).name('daylight');
 gB.add(cfg.rain, 'shaft', 0, 60, 0.5).name('shaft density');
