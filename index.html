@@ -1501,10 +1501,13 @@ const waterMat = new THREE.ShaderMaterial({
         vec2  d2 = wp0.xz - rp.xy;
         float d  = length(d2);
         float front = age * 1.35;                    // ring radius
-        float env = exp(-abs(d - front) * 3.6) * exp(-age * 1.05) * exp(-d * 0.30);
+        /* Reach mattered more than height. At exp(-d * 0.30) a ring was
+           gone within three metres of where it landed, so from anywhere
+           down the nave a drip made no visible mark at all.         */
+        float env = exp(-abs(d - front) * 3.0) * exp(-age * 0.85) * exp(-d * 0.14);
         float phase = (d - front) * 13.0;
-        disp.y += rp.w * 0.048 * env * cos(phase);
-        vec2 g = (d > 1e-4 ? d2 / d : vec2(0.0)) * rp.w * 0.62 * env * sin(phase);
+        disp.y += rp.w * 0.075 * env * cos(phase);
+        vec2 g = (d > 1e-4 ? d2 / d : vec2(0.0)) * rp.w * 1.05 * env * sin(phase);
         acc.x -= g.x;
         acc.z -= g.y;
       }
@@ -2317,10 +2320,13 @@ function updateLife(dt, t) {
     const surf = wy + waveAt(d.x, d.z, wt, amp).y;
     if (d.y <= surf) {
       d.y = TOP;
-      // one ring in every twenty-odd, or the buffer is all rain
-      if ((i & 31) === 0) {
+      /* Every impact rings while the rain is light. This used to be one
+         drop in thirty-two, which was right at nine hundred drops and
+         silly at five — one of the five could ever make a ring, so the
+         water under the breach was glass.                          */
+      if (nR <= 48 || (i & 15) === 0) {
         const r = waterUniforms.uRipples.value[rippleIdx++ % 12];
-        r.set(d.x, d.z, t, 0.42);
+        r.set(d.x, d.z, t, 0.85);
       }
     }
     rainPos[i * 3] = d.x;
@@ -2872,17 +2878,37 @@ function applyLook(name) {
 }
 
 /* ── persistence ──────────────────────────────────────────────────
-   Merged key by key against the defaults, so a stored blob from an
-   older build can never introduce a key the code no longer reads or
-   drop one it now needs.                                          */
-const STORE = 'navis.settings.v1';
+   Only what differs from the defaults is stored. Saving the whole
+   config was a mistake: it meant every value the code shipped was
+   pinned at whatever it happened to be on a visitor's first load, so
+   no default could ever reach anyone who had been here before. Storing
+   the diff keeps a deliberate choice and lets everything untouched
+   follow the build.
+   Merged key by key against the defaults on the way back in, so an old
+   blob cannot introduce a key the code no longer reads.            */
+const STORE = 'navis.settings.v2';
 let saveTimer = 0, storeReady = false;
 
+function diffFrom(cur, def) {
+  const out = {};
+  for (const k in def) {
+    if (def[k] && typeof def[k] === 'object') {
+      const sub = diffFrom(cur[k], def[k]);
+      if (Object.keys(sub).length) out[k] = sub;
+    } else if (cur[k] !== def[k]) out[k] = cur[k];
+  }
+  return out;
+}
 function saveSoon() {
   if (!storeReady) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try { localStorage.setItem(STORE, JSON.stringify(cfg)); } catch (e) { /* private mode */ }
+    try {
+      const d = diffFrom(cfg, DEFAULTS);
+      if (Object.keys(d).length) localStorage.setItem(STORE, JSON.stringify(d));
+      else localStorage.removeItem(STORE);
+      localStorage.removeItem('navis.settings.v1');   // retire the full blob
+    } catch (e) { /* private mode */ }
   }, 300);
 }
 function mergeInto(dst, src, ref) {
@@ -2900,7 +2926,10 @@ function loadSettings() {
   return true;
 }
 function resetSettings() {
-  try { localStorage.removeItem(STORE); } catch (e) { /* ignore */ }
+  try {
+    localStorage.removeItem(STORE);
+    localStorage.removeItem('navis.settings.v1');
+  } catch (e) { /* ignore */ }
   mergeInto(cfg, DEFAULTS, DEFAULTS);
   cfg.camera.mode = 'cinematic';
   VOL_SCALE = cfg.vol.scale;
